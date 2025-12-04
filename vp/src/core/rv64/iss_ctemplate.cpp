@@ -89,6 +89,9 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 		if (i == Operation::OpId::VSETVLI) {
 			opMap[i].instr_time = 300 * prop_clock_cycle_period.value();
 		}
+		if (i == Operation::OpId::VADD_VI) {
+			opMap[i].instr_time = 30 * prop_clock_cycle_period.value();
+		}
 	}
 }
 
