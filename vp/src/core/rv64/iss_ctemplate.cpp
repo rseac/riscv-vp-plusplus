@@ -87,10 +87,10 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 
 		// Set the specific latency for the instruction
 		if (i == Operation::OpId::VSETVLI) {
-			opMap[i].instr_time = 300 * prop_clock_cycle_period.value();
+			opMap[i].instr_time = 1 * prop_clock_cycle_period.value();
 		}
 		if (i == Operation::OpId::VADD_VI) {
-			opMap[i].instr_time = 30 * prop_clock_cycle_period.value();
+			opMap[i].instr_time = 0 * prop_clock_cycle_period.value();
 		}
 	}
 }
@@ -7659,6 +7659,8 @@ void ISS_CT::show() {
 	std::cout << "simulation time: " << sc_core::sc_time_stamp() << std::endl;
 	uint64_t sim_time_cycles = sc_core::sc_time_stamp().value() / prop_clock_cycle_period.value();
 	std::cout << "clock cycles: " << sim_time_cycles << std::endl;
+	uint64_t csr_cycle_counter = cycle_counter.value() / prop_clock_cycle_period.value();
+	std::cout << "CSR cycle counter (mcycle): " << csr_cycle_counter << std::endl;
 	regs.show();
 	std::cout << "pc = " << std::hex << pc << std::endl;
 	std::cout << "num-instr = " << std::dec << csrs.instret.reg.val << std::endl;

@@ -16,7 +16,8 @@ template <typename T_RVX_ISS>
 struct InstrMemoryProxy_T : public instr_memory_if {
 	/* config properties */
 	sc_core::sc_time prop_clock_cycle_period = sc_core::sc_time(10, sc_core::SC_NS);
-	unsigned int prop_access_clock_cycles = 2;
+	unsigned int prop_access_clock_cycles = 0;
+	// unsigned int prop_access_clock_cycles = 2;
 
 	MemoryDMI dmi;
 
@@ -49,7 +50,8 @@ struct CombinedMemoryInterface_T : public sc_core::sc_module,
                                    public mmu_memory_if {
 	/* config properties */
 	sc_core::sc_time prop_clock_cycle_period = sc_core::sc_time(10, sc_core::SC_NS);
-	unsigned int prop_dmi_access_clock_cycles = 4;
+	// unsigned int prop_dmi_access_clock_cycles = 4;
+	unsigned int prop_dmi_access_clock_cycles = 0;
 
 	T_RVX_ISS &iss;
 	std::shared_ptr<bus_lock_if> bus_lock;
