@@ -105,6 +105,7 @@ class ISSStats : public ISSStatsDummy {
 	ISSStats(uint64_t hartId) : ISSStatsDummy(hartId) {
 		reset();
 	}
+	~ISSStats();
 
 	void reset();
 

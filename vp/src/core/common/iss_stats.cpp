@@ -8,7 +8,8 @@
  * (counting is always enabled in ISSStats)
  */
 // #define ISS_STATS_OUTPUT_OPID_STATS_ENABLED
-#undef ISS_STATS_OUTPUT_OPID_STATS_ENABLED
+//#undef ISS_STATS_OUTPUT_OPID_STATS_ENABLED
+#define ISS_STATS_OUTPUT_OPID_STATS_ENABLED
 
 /*
  * enable/disabled raw csv output of all stats (disabled by default)
@@ -23,6 +24,10 @@ void ISSStats::reset() {
 #define ISSSTATS_STAT_RATE_ONLY(_val, _sum) "(" << (double)(_val) / (_sum) << ")\n"
 #define ISSSTATS_STAT_RATE(_val, _sum) (_val) << "\t\t" << ISSSTATS_STAT_RATE_ONLY(_val, _sum)
 #define ISSSTATS_STAT_RATE_CNT(_val) ISSSTATS_STAT_RATE(_val, s.cnt)
+
+ISSStats::~ISSStats() {
+	print();
+}
 
 void ISSStats::print() {
 	std::cout << "============================================================================================="

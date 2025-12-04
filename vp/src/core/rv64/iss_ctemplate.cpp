@@ -54,10 +54,12 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 	 */
 	for (int i = 0; i < Operation::OpId::NUMBER_OF_OPERATIONS; ++i) {
 		opMap[i].opId = (Operation::OpId)i;
-		opMap[i].instr_time = prop_clock_cycle_period.value(); /* ps */
+		// opMap[i].instr_time = prop_clock_cycle_period.value(); /* ps */
+		opMap[i].instr_time = 0;
 		opMap[i].labelPtr = nullptr;
 	}
 
+	/*
 	uint64_t memory_access_cycles = 4 * prop_clock_cycle_period.value();
 	uint64_t mul_div_cycles = 8 * prop_clock_cycle_period.value();
 
@@ -77,6 +79,17 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 	opMap[Operation::OpId::DIVU].instr_time = mul_div_cycles;
 	opMap[Operation::OpId::REM].instr_time = mul_div_cycles;
 	opMap[Operation::OpId::REMU].instr_time = mul_div_cycles;
+	*/
+
+	// Disable instr_time for vector instructions
+	for (int i = Operation::OpId::VSETVLI; i <= Operation::OpId::VMV_NR_R_V; ++i) {
+		opMap[i].instr_time = 0;
+
+		// Set the specific latency for the instruction
+		if (i == Operation::OpId::VSETVLI) {
+			opMap[i].instr_time = 300 * prop_clock_cycle_period.value();
+		}
+	}
 }
 
 void ISS_CT::print_trace() {
@@ -7641,6 +7654,8 @@ void ISS_CT::show() {
 	boost::io::ios_flags_saver ifs(std::cout);
 	std::cout << "=[ core : " << csrs.mhartid.reg.val << " ]===========================" << std::endl;
 	std::cout << "simulation time: " << sc_core::sc_time_stamp() << std::endl;
+	uint64_t sim_time_cycles = sc_core::sc_time_stamp().value() / prop_clock_cycle_period.value();
+	std::cout << "clock cycles: " << sim_time_cycles << std::endl;
 	regs.show();
 	std::cout << "pc = " << std::hex << pc << std::endl;
 	std::cout << "num-instr = " << std::dec << csrs.instret.reg.val << std::endl;

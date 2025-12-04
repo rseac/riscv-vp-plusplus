@@ -7426,6 +7426,8 @@ void ISS_CT::show() {
 	boost::io::ios_flags_saver ifs(std::cout);
 	std::cout << "=[ core : " << csrs.mhartid.reg.val << " ]===========================" << std::endl;
 	std::cout << "simulation time: " << sc_core::sc_time_stamp() << std::endl;
+	uint64_t sim_time_cycles = sc_core::sc_time_stamp().value() / prop_clock_cycle_period.value();
+std::cout << "clock cycles: " << sim_time_cycles << std::endl;
 	regs.show();
 	std::cout << "pc = " << std::hex << pc << std::endl;
 	std::cout << "num-instr = " << std::dec << csrs.instret.reg.val << std::endl;
