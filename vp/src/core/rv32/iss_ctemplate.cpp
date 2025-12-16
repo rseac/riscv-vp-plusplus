@@ -70,6 +70,13 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 	opMap[Operation::OpId::DIVU].instr_time = mul_div_cycles;
 	opMap[Operation::OpId::REM].instr_time = mul_div_cycles;
 	opMap[Operation::OpId::REMU].instr_time = mul_div_cycles;
+
+	for (int i = 0; i < Operation::OpId::NUMBER_OF_OPERATIONS; ++i) {
+		std::string name = Operation::opIdStr[i];
+		sc_core::sc_time time_val(opMap[i].instr_time, sc_core::SC_PS);
+		VPPP_PROPERTY_GET("ISS." + this->name(), "timing." + name, sc_core::sc_time, time_val);
+		opMap[i].instr_time = time_val.value();
+	}
 }
 
 void ISS_CT::print_trace() {
