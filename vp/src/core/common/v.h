@@ -11,7 +11,7 @@
 #undef DEBUG_PRINT_TRAPS
 
 // TODO these should be compile arguments
-constexpr unsigned VLEN = 512;
+constexpr unsigned VLEN = 128;  // 512;
 constexpr unsigned ELEN = 64;
 constexpr unsigned SEW_MIN = 8;
 constexpr unsigned VLENB = VLEN / 8;
