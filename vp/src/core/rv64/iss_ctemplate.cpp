@@ -59,25 +59,180 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 		opMap[i].labelPtr = nullptr;
 	}
 
-	uint64_t memory_access_cycles = 4 * prop_clock_cycle_period.value();
-	uint64_t mul_div_cycles = 8 * prop_clock_cycle_period.value();
+	// SiFive P600 Latencies
+	uint64_t lat_alu = 1 * prop_clock_cycle_period.value();
+	uint64_t lat_load = 4 * prop_clock_cycle_period.value();
+	uint64_t lat_store = 1 * prop_clock_cycle_period.value();  // Store latency 1 in P600 LLVM model
+	uint64_t lat_imul = 2 * prop_clock_cycle_period.value();
+	uint64_t lat_idiv64 = 35 * prop_clock_cycle_period.value();
+	uint64_t lat_idiv32 = 20 * prop_clock_cycle_period.value();
+	uint64_t lat_fadd = 2 * prop_clock_cycle_period.value();
+	uint64_t lat_fmul = 3 * prop_clock_cycle_period.value();
+	uint64_t lat_fma = 4 * prop_clock_cycle_period.value();
+	uint64_t lat_fdiv16 = 4 * prop_clock_cycle_period.value();
+	uint64_t lat_fdiv32 = 6 * prop_clock_cycle_period.value();
+	uint64_t lat_fdiv64 = 11 * prop_clock_cycle_period.value();
+	uint64_t lat_fsqrt16 = 18 * prop_clock_cycle_period.value();
+	uint64_t lat_fsqrt32 = 18 * prop_clock_cycle_period.value();
+	uint64_t lat_fsqrt64 = 33 * prop_clock_cycle_period.value();
+	uint64_t lat_fmisc = 2 * prop_clock_cycle_period.value();
+	uint64_t lat_atomic = 3 * prop_clock_cycle_period.value();
 
-	opMap[Operation::OpId::LB].instr_time = memory_access_cycles;
-	opMap[Operation::OpId::LBU].instr_time = memory_access_cycles;
-	opMap[Operation::OpId::LH].instr_time = memory_access_cycles;
-	opMap[Operation::OpId::LHU].instr_time = memory_access_cycles;
-	opMap[Operation::OpId::LW].instr_time = memory_access_cycles;
-	opMap[Operation::OpId::SB].instr_time = memory_access_cycles;
-	opMap[Operation::OpId::SH].instr_time = memory_access_cycles;
-	opMap[Operation::OpId::SW].instr_time = memory_access_cycles;
-	opMap[Operation::OpId::MUL].instr_time = mul_div_cycles;
-	opMap[Operation::OpId::MULH].instr_time = mul_div_cycles;
-	opMap[Operation::OpId::MULHU].instr_time = mul_div_cycles;
-	opMap[Operation::OpId::MULHSU].instr_time = mul_div_cycles;
-	opMap[Operation::OpId::DIV].instr_time = mul_div_cycles;
-	opMap[Operation::OpId::DIVU].instr_time = mul_div_cycles;
-	opMap[Operation::OpId::REM].instr_time = mul_div_cycles;
-	opMap[Operation::OpId::REMU].instr_time = mul_div_cycles;
+	// Default all to 1 (ALU)
+	for (int i = 0; i < Operation::OpId::NUMBER_OF_OPERATIONS; ++i) {
+		opMap[i].instr_time = lat_alu;
+	}
+
+	// Loads
+	opMap[Operation::OpId::LB].instr_time = lat_load;
+	opMap[Operation::OpId::LBU].instr_time = lat_load;
+	opMap[Operation::OpId::LH].instr_time = lat_load;
+	opMap[Operation::OpId::LHU].instr_time = lat_load;
+	opMap[Operation::OpId::LW].instr_time = lat_load;
+	opMap[Operation::OpId::LWU].instr_time = lat_load;
+	opMap[Operation::OpId::LD].instr_time = lat_load;
+	opMap[Operation::OpId::FLH].instr_time = 5 * prop_clock_cycle_period.value();  // P600: 5 cycles for Float Load
+	opMap[Operation::OpId::FLW].instr_time = 5 * prop_clock_cycle_period.value();
+	opMap[Operation::OpId::FLD].instr_time = 5 * prop_clock_cycle_period.value();
+
+	// Stores
+	opMap[Operation::OpId::SB].instr_time = lat_store;
+	opMap[Operation::OpId::SH].instr_time = lat_store;
+	opMap[Operation::OpId::SW].instr_time = lat_store;
+	opMap[Operation::OpId::SD].instr_time = lat_store;
+	opMap[Operation::OpId::FSH].instr_time = lat_store;
+	opMap[Operation::OpId::FSW].instr_time = lat_store;
+	opMap[Operation::OpId::FSD].instr_time = lat_store;
+
+	// Integer Arithmetic
+	opMap[Operation::OpId::MUL].instr_time = lat_imul;
+	opMap[Operation::OpId::MULH].instr_time = lat_imul;
+	opMap[Operation::OpId::MULHU].instr_time = lat_imul;
+	opMap[Operation::OpId::MULHSU].instr_time = lat_imul;
+	opMap[Operation::OpId::MULW].instr_time = lat_imul;
+
+	opMap[Operation::OpId::DIV].instr_time = lat_idiv64;
+	opMap[Operation::OpId::DIVU].instr_time = lat_idiv64;
+	opMap[Operation::OpId::REM].instr_time = lat_idiv64;
+	opMap[Operation::OpId::REMU].instr_time = lat_idiv64;
+	opMap[Operation::OpId::DIVW].instr_time = lat_idiv32;
+	opMap[Operation::OpId::DIVUW].instr_time = lat_idiv32;
+	opMap[Operation::OpId::REMW].instr_time = lat_idiv32;
+	opMap[Operation::OpId::REMUW].instr_time = lat_idiv32;
+
+	// Floating Point
+	// Add/Sub
+	opMap[Operation::OpId::FADD_H].instr_time = lat_fadd;
+	opMap[Operation::OpId::FSUB_H].instr_time = lat_fadd;
+	opMap[Operation::OpId::FADD_S].instr_time = lat_fadd;
+	opMap[Operation::OpId::FSUB_S].instr_time = lat_fadd;
+	opMap[Operation::OpId::FADD_D].instr_time = lat_fadd;
+	opMap[Operation::OpId::FSUB_D].instr_time = lat_fadd;
+
+	// Mul
+	opMap[Operation::OpId::FMUL_H].instr_time = lat_fmul;
+	opMap[Operation::OpId::FMUL_S].instr_time = lat_fmul;
+	opMap[Operation::OpId::FMUL_D].instr_time = lat_fmul;
+
+	// FMA
+	opMap[Operation::OpId::FMADD_H].instr_time = lat_fma;
+	opMap[Operation::OpId::FMSUB_H].instr_time = lat_fma;
+	opMap[Operation::OpId::FNMADD_H].instr_time = lat_fma;
+	opMap[Operation::OpId::FNMSUB_H].instr_time = lat_fma;
+	opMap[Operation::OpId::FMADD_S].instr_time = lat_fma;
+	opMap[Operation::OpId::FMSUB_S].instr_time = lat_fma;
+	opMap[Operation::OpId::FNMADD_S].instr_time = lat_fma;
+	opMap[Operation::OpId::FNMSUB_S].instr_time = lat_fma;
+	opMap[Operation::OpId::FMADD_D].instr_time = lat_fma;
+	opMap[Operation::OpId::FMSUB_D].instr_time = lat_fma;
+	opMap[Operation::OpId::FNMADD_D].instr_time = lat_fma;
+	opMap[Operation::OpId::FNMSUB_D].instr_time = lat_fma;
+
+	// Div/Sqrt
+	opMap[Operation::OpId::FDIV_H].instr_time = lat_fdiv16;
+	opMap[Operation::OpId::FSQRT_H].instr_time = lat_fsqrt16;
+	opMap[Operation::OpId::FDIV_S].instr_time = lat_fdiv32;
+	opMap[Operation::OpId::FSQRT_S].instr_time = lat_fsqrt32;
+	opMap[Operation::OpId::FDIV_D].instr_time = lat_fdiv64;
+	opMap[Operation::OpId::FSQRT_D].instr_time = lat_fsqrt64;
+
+	// Misc (Conv, Min/Max, Sgnj - all 2 cycles in P600)
+	opMap[Operation::OpId::FSGNJ_H].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FSGNJN_H].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FSGNJX_H].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FMIN_H].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FMAX_H].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_S_H].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_D_H].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_H_S].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_D_S].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_H_D].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_S_D].instr_time = lat_fmisc;
+
+	opMap[Operation::OpId::FSGNJ_S].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FSGNJN_S].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FSGNJX_S].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FMIN_S].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FMAX_S].instr_time = lat_fmisc;
+
+	opMap[Operation::OpId::FSGNJ_D].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FSGNJN_D].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FSGNJX_D].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FMIN_D].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FMAX_D].instr_time = lat_fmisc;
+
+	// Conversions to/from Int (2 cycles)
+	opMap[Operation::OpId::FCVT_W_H].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_WU_H].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_H_W].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_H_WU].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_L_H].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_LU_H].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_H_L].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_H_LU].instr_time = lat_fmisc;
+
+	opMap[Operation::OpId::FCVT_W_S].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_WU_S].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_S_W].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_S_WU].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_L_S].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_LU_S].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_S_L].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_S_LU].instr_time = lat_fmisc;
+
+	opMap[Operation::OpId::FCVT_W_D].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_WU_D].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_D_W].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_D_WU].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_L_D].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_LU_D].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_D_L].instr_time = lat_fmisc;
+	opMap[Operation::OpId::FCVT_D_LU].instr_time = lat_fmisc;
+
+	// Atomics (Latency 3)
+	opMap[Operation::OpId::AMOADD_W].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOXOR_W].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOOR_W].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOAND_W].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOMIN_W].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOMAX_W].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOMINU_W].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOMAXU_W].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOSWAP_W].instr_time = lat_atomic;
+	opMap[Operation::OpId::LR_W].instr_time = lat_atomic;
+	opMap[Operation::OpId::SC_W].instr_time = lat_atomic;
+
+	opMap[Operation::OpId::AMOADD_D].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOXOR_D].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOOR_D].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOAND_D].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOMIN_D].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOMAX_D].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOMINU_D].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOMAXU_D].instr_time = lat_atomic;
+	opMap[Operation::OpId::AMOSWAP_D].instr_time = lat_atomic;
+	opMap[Operation::OpId::LR_D].instr_time = lat_atomic;
+	opMap[Operation::OpId::SC_D].instr_time = lat_atomic;
 
 	// Configure Vector Instruction Latencies (SiFive P600 approximation)
 	for (int i = Operation::OpId::VSETVLI; i <= Operation::OpId::VMV_NR_R_V; ++i) {
@@ -298,13 +453,6 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 				opMap[i].instr_time = 25 * prop_clock_cycle_period.value();
 				break;
 		}
-	}
-
-	for (int i = 0; i < Operation::OpId::NUMBER_OF_OPERATIONS; ++i) {
-		std::string name = Operation::opIdStr[i];
-		sc_core::sc_time time_val(opMap[i].instr_time, sc_core::SC_PS);
-		VPPP_PROPERTY_GET("ISS." + this->name(), "timing." + name, sc_core::sc_time, time_val);
-		opMap[i].instr_time = time_val.value();
 	}
 }
 
