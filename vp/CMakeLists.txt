@@ -4,6 +4,11 @@ project(riscv-vp
 )
 
 option(USE_SYSTEM_SYSTEMC "use systemc version provided by the system" OFF)
+option(ENABLE_ARA_LATENCIES "Enable ARA vector instruction latencies" OFF)
+
+if(ENABLE_ARA_LATENCIES)
+	add_definitions(-DENABLE_ARA_LATENCIES)
+endif()
 
 # Suppress SystemC deprecation warnings - esp. for SC_HAS_PROCESS
 #
