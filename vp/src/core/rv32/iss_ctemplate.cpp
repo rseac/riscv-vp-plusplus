@@ -327,7 +327,8 @@ void *ISS_CT::genOpMap() {
 	OP_LABEL_OP(_op)                                                                                                 \
 	    : static struct op_label_entry OP_LABEL_ENTRY_OP(_op)                                                        \
 	          __attribute__((used, section(OP_LABLE_ENTRIES_SEC_STR))) = {Operation::OpId::_op, &&OP_LABEL_OP(_op)}; \
-	stats.inc_op(Operation::OpId::_op);
+	stats.inc_op(Operation::OpId::_op);                                                                              \
+	v_ext.setCurrentOpId(Operation::OpId::_op);
 
 #define OP_INVALID_END()                                                                                             \
 	if (trace) {                                                                                                     \

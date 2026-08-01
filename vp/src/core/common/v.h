@@ -3,6 +3,9 @@
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cstring>
 
+#include "ara_timing.h"
+#include "ara_timing_classify.h"
+
 /*
  * print unmet traps (reasons) to stdout
  * (see v_assert)
@@ -27,6 +30,11 @@ class VExtension {
    private:
 	void* v_regs;  // TODO: could be initialized randomly
 	iss_type& iss;
+
+	// --- AraXL Timing Model ---
+	ara_timing::AraTimingModel* timing_model_ = nullptr;
+	Operation::OpId current_opId_ = Operation::OpId::NUMBER_OF_OPERATIONS;
+	bool timing_enabled_ = false;
 
    public:
 	constexpr static unsigned VS_OFF = 0b00;
@@ -83,6 +91,32 @@ class VExtension {
 		v_regs = malloc(NUM_REGS * VLENB);
 		memset(v_regs, 0, NUM_REGS * VLENB);
 	}
+
+	/**
+	 * Initialize the AraXL timing model with the given configuration.
+	 * Must be called after ISS construction (properties loaded).
+	 */
+	void initTimingModel(const ara_timing::AraConfig& cfg) {
+		timing_model_ = new ara_timing::AraTimingModel(cfg);
+		timing_enabled_ = true;
+	}
+
+	~VExtension() {
+		delete timing_model_;
+		free(v_regs);
+	}
+
+	/**
+	 * Set the current OpId for the timing model (called from prepInstr).
+	 */
+	void setCurrentOpId(Operation::OpId opId) {
+		current_opId_ = opId;
+	}
+
+	/**
+	 * Check if timing model is enabled.
+	 */
+	bool timingEnabled() const { return timing_enabled_; }
 
 	template <typename T>
 	void reg_write(xlen_reg_t vec_idx, xlen_reg_t elem_num, T val) {
@@ -296,6 +330,52 @@ class VExtension {
 		if (is_fp) {
 			iss.fp_finish_instr();
 		}
+
+		// --- AraXL Timing Model: Dynamic cycle injection ---
+		if (timing_enabled_ && timing_model_ &&
+		    current_opId_ != Operation::OpId::NUMBER_OF_OPERATIONS &&
+		    ara_timing::isVectorOp(current_opId_)) {
+
+			ara_timing::AraFU fu = ara_timing::classifyFU(current_opId_);
+
+			// Skip VSETVL — handled by scalar core (1 cycle default)
+			if (fu != ara_timing::AraFU::VSETVL) {
+				// Build instruction descriptor from runtime CSR state
+				ara_timing::AraVecInsn desc;
+				desc.fu = fu;
+				desc.vl = iss.csrs.vl.reg.val;
+				desc.sew = 1 << (iss.csrs.vtype.reg.fields.vsew + 3);
+				desc.lmul_num = 1;
+				desc.lmul_den = 1;
+				desc.stride = 0;
+				desc.sew_idx = 0;
+				desc.is_widening = false;
+
+				// Decode LMUL from vtype
+				uint32_t vlmul_field = iss.csrs.vtype.reg.fields.vlmul;
+				if (vlmul_field <= 3) {
+					// LMUL = 1, 2, 4, 8
+					desc.lmul_num = 1u << vlmul_field;
+					desc.lmul_den = 1;
+				} else if (vlmul_field >= 5) {
+					// Fractional LMUL: 5=1/8, 6=1/4, 7=1/2
+					desc.lmul_num = 1;
+					desc.lmul_den = 1u << (8 - vlmul_field);
+				}
+
+				// For memory ops: use the EEW from the instruction encoding
+				uint32_t mem_eew = ara_timing::getMemEEW(current_opId_);
+				if (mem_eew > 0) {
+					desc.sew = mem_eew;
+				}
+
+				// Compute and inject cycles
+				uint64_t cycles = timing_model_->computeCycles(desc);
+				iss.ara_inject_cycles(cycles);
+			}
+		}
+
+		current_opId_ = Operation::OpId::NUMBER_OF_OPERATIONS;
 	}
 
 	xlen_reg_t getIntVSew() {

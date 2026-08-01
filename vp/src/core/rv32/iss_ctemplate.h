@@ -127,6 +127,15 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		}
 	}
 
+	/**
+	 * Inject N clock cycles into the dbbcache cycle counter.
+	 * Used by the AraXL vector timing model.
+	 */
+	__always_inline void ara_inject_cycles(uint64_t n_cycles) {
+		uint64_t ps = n_cycles * prop_clock_cycle_period.value();
+		dbbcache.inject_cycles_ps(ps);
+	}
+
 	/* update instr and cycle counters by local fast counters, update quantum_keeper and reset fast quantum */
 	__always_inline void commit_all_and_reset_fast_quantum(uint64_t &ninstr) {
 		/* commit instructions -> update ninstr to csrs */

@@ -316,6 +316,14 @@ class DBBCacheDummy_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if
 		return cycle_counter_raw;
 	}
 
+	/**
+	 * Inject additional cycles into the raw cycle counter.
+	 * Used by the AraXL vector timing model.
+	 */
+	__always_inline void inject_cycles_ps(uint64_t ps_to_add) {
+		cycle_counter_raw += ps_to_add;
+	}
+
 	uint32_t get_mem_word() {
 		return this->mem_word;
 	}
