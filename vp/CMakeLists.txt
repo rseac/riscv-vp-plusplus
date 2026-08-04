@@ -10,7 +10,7 @@ option(USE_SYSTEM_SYSTEMC "use systemc version provided by the system" OFF)
 # SC_HAS_PROCESS is obsolete in IEEE 1666-2023 and could be safely removed.
 # However, we want to keep it for now to stay compatible with older SystemC versions
 # TODO: remove SC_HAS_PROCESS and this below at a later point in time
-add_definitions(-DSC_ALLOW_DEPRECATED_IEEE_API)
+add_definitions(-DSC_ALLOW_DEPRECATED_IEEE_API -DPROPERTYTREE_ENABLED)
 
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Debug)

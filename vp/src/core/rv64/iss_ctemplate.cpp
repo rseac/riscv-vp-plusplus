@@ -16,6 +16,7 @@
 // for safe down-cast
 #include <boost/lexical_cast.hpp>
 
+#include "core/common/ara_timing.h"
 #include "util/propertytree.h"
 
 namespace rv64 {
@@ -161,6 +162,71 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 
 		/* set instruction time */
 		opMap[opId].instr_time = instr_clock_cycles * prop_clock_cycle_period.value(); /* ps */
+	}
+
+	/*
+	 * AraXL Vector Timing Model Initialization
+	 *
+	 * Load timing model parameters from property tree and initialize the
+	 * dynamic timing engine. When enabled, vector instruction static timing
+	 * is zeroed out and replaced with dynamic per-execution cycle injection.
+	 */
+	{
+		uint64_t ara_timing_enabled = 1;
+		VPPP_PROPERTY_GET("ISS." + name(), "ara_timing_enabled", uint64_t, ara_timing_enabled);
+
+		if (ara_timing_enabled) {
+			ara_timing::AraConfig ara_cfg;
+
+			// Load tunable parameters from property tree
+			uint64_t tmp;
+
+			tmp = ara_cfg.nr_lanes;
+			VPPP_PROPERTY_GET("ISS." + name(), "ara_nr_lanes", uint64_t, tmp);
+			ara_cfg.nr_lanes = (uint32_t)tmp;
+
+			tmp = ara_cfg.nr_clusters;
+			VPPP_PROPERTY_GET("ISS." + name(), "ara_nr_clusters", uint64_t, tmp);
+			ara_cfg.nr_clusters = (uint32_t)tmp;
+
+			tmp = ara_cfg.vlen;
+			VPPP_PROPERTY_GET("ISS." + name(), "ara_vlen", uint64_t, tmp);
+			ara_cfg.vlen = (uint32_t)tmp;
+
+			tmp = ara_cfg.tau_mem;
+			VPPP_PROPERTY_GET("ISS." + name(), "ara_tau_mem", uint64_t, tmp);
+			ara_cfg.tau_mem = (uint32_t)tmp;
+
+			tmp = ara_cfg.c_harness;
+			VPPP_PROPERTY_GET("ISS." + name(), "ara_c_harness", uint64_t, tmp);
+			ara_cfg.c_harness = (uint32_t)tmp;
+
+			tmp = (uint64_t)(ara_cfg.c_per_elem_gather * 10);  // encode as fixed-point *10
+			VPPP_PROPERTY_GET("ISS." + name(), "ara_c_per_elem_gather_x10", uint64_t, tmp);
+			ara_cfg.c_per_elem_gather = (double)tmp / 10.0;
+
+			tmp = ara_cfg.c_startup_floor_gather;
+			VPPP_PROPERTY_GET("ISS." + name(), "ara_c_startup_floor_gather", uint64_t, tmp);
+			ara_cfg.c_startup_floor_gather = (uint32_t)tmp;
+
+			tmp = ara_cfg.c_fe_fpu_ew32;
+			VPPP_PROPERTY_GET("ISS." + name(), "ara_c_fe_fpu_ew32", uint64_t, tmp);
+			ara_cfg.c_fe_fpu_ew32 = (uint32_t)tmp;
+
+			tmp = ara_cfg.c_fe_fpu_ew64;
+			VPPP_PROPERTY_GET("ISS." + name(), "ara_c_fe_fpu_ew64", uint64_t, tmp);
+			ara_cfg.c_fe_fpu_ew64 = (uint32_t)tmp;
+
+			// Initialize the timing model in VExtension
+			v_ext.initTimingModel(ara_cfg);
+
+			// Zero out static timing for all vector operations.
+			// Dynamic timing is injected via finishInstr() hook.
+			for (unsigned int opId = Operation::OpId::VSETVLI;
+			     opId <= Operation::OpId::VMV_NR_R_V; ++opId) {
+				opMap[opId].instr_time = 0;
+			}
+		}
 	}
 }
 
@@ -337,7 +403,8 @@ void *ISS_CT::genOpMap() {
 	OP_LABEL_OP(_op)                                                                                                 \
 	    : static struct op_label_entry OP_LABEL_ENTRY_OP(_op)                                                        \
 	          __attribute__((used, section(OP_LABLE_ENTRIES_SEC_STR))) = {Operation::OpId::_op, &&OP_LABEL_OP(_op)}; \
-	stats.inc_op(Operation::OpId::_op);
+	stats.inc_op(Operation::OpId::_op);                                                                              \
+	v_ext.setCurrentOpId(Operation::OpId::_op);
 
 #define OP_INVALID_END()                                                                                             \
 	if (trace) {                                                                                                     \

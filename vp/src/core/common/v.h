@@ -3,6 +3,9 @@
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cstring>
 
+#include "ara_timing.h"
+#include "ara_timing_classify.h"
+
 /*
  * print unmet traps (reasons) to stdout
  * (see v_assert)
@@ -10,8 +13,10 @@
 // #define DEBUG_PRINT_TRAPS
 #undef DEBUG_PRINT_TRAPS
 
-// TODO these should be compile arguments
-constexpr unsigned VLEN = 512;
+// VLEN set to 8192 to support all calibration configurations (2L/4L/8L x 2048/4096/8192).
+// The timing model uses its own VLEN from the property tree for cycle calculations.
+// The ISS VLEN just determines the max VL achievable (register file capacity).
+constexpr unsigned VLEN = 8192;
 constexpr unsigned ELEN = 64;
 constexpr unsigned SEW_MIN = 8;
 constexpr unsigned VLENB = VLEN / 8;
@@ -27,6 +32,14 @@ class VExtension {
    private:
 	void* v_regs;  // TODO: could be initialized randomly
 	iss_type& iss;
+
+	// --- AraXL Timing Model ---
+	ara_timing::AraTimingModel* timing_model_ = nullptr;
+	Operation::OpId current_opId_ = Operation::OpId::NUMBER_OF_OPERATIONS;
+	bool timing_enabled_ = false;
+	bool pending_vsetvli_ = false;  // tracks if last vector op was vsetvli
+	uint64_t vsetvli_instr_count_ = 0; // instruction count when vsetvli fired
+	bool first_vec_in_window_ = true; // true until first non-vsetvli vec op fires
 
    public:
 	constexpr static unsigned VS_OFF = 0b00;
@@ -83,6 +96,32 @@ class VExtension {
 		v_regs = malloc(NUM_REGS * VLENB);
 		memset(v_regs, 0, NUM_REGS * VLENB);
 	}
+
+	/**
+	 * Initialize the AraXL timing model with the given configuration.
+	 * Must be called after ISS construction (properties loaded).
+	 */
+	void initTimingModel(const ara_timing::AraConfig& cfg) {
+		timing_model_ = new ara_timing::AraTimingModel(cfg);
+		timing_enabled_ = true;
+	}
+
+	~VExtension() {
+		delete timing_model_;
+		free(v_regs);
+	}
+
+	/**
+	 * Set the current OpId for the timing model (called from prepInstr).
+	 */
+	void setCurrentOpId(Operation::OpId opId) {
+		current_opId_ = opId;
+	}
+
+	/**
+	 * Check if timing model is enabled.
+	 */
+	bool timingEnabled() const { return timing_enabled_; }
 
 	template <typename T>
 	void reg_write(xlen_reg_t vec_idx, xlen_reg_t elem_num, T val) {
@@ -296,6 +335,94 @@ class VExtension {
 		if (is_fp) {
 			iss.fp_finish_instr();
 		}
+
+		// --- AraXL Timing Model: Dynamic cycle injection ---
+		if (timing_enabled_ && timing_model_ &&
+		    current_opId_ != Operation::OpId::NUMBER_OF_OPERATIONS &&
+		    ara_timing::isVectorOp(current_opId_)) {
+
+			ara_timing::AraFU fu = ara_timing::classifyFU(current_opId_);
+
+			// Skip VSETVL — handled by scalar core (1 cycle default)
+			if (fu != ara_timing::AraFU::VSETVL) {
+				// Build instruction descriptor from runtime CSR state
+				ara_timing::AraVecInsn desc;
+				desc.fu = fu;
+				desc.vl = iss.csrs.vl.reg.val;
+				desc.sew = 1 << (iss.csrs.vtype.reg.fields.vsew + 3);
+				desc.lmul_num = 1;
+				desc.lmul_den = 1;
+				desc.stride = 0;
+				desc.sew_idx = 0;
+				desc.is_widening = false;
+
+				// Decode LMUL from vtype
+				uint32_t vlmul_field = iss.csrs.vtype.reg.fields.vlmul;
+				if (vlmul_field <= 3) {
+					// LMUL = 1, 2, 4, 8
+					desc.lmul_num = 1u << vlmul_field;
+					desc.lmul_den = 1;
+				} else if (vlmul_field >= 5) {
+					// Fractional LMUL: 5=1/8, 6=1/4, 7=1/2
+					desc.lmul_num = 1;
+					desc.lmul_den = 1u << (8 - vlmul_field);
+				}
+
+				// For memory ops: use the EEW from the instruction encoding
+				uint32_t mem_eew = ara_timing::getMemEEW(current_opId_);
+				if (mem_eew > 0) {
+					desc.sew = mem_eew;
+				}
+
+				// Deferred vsetvli cost: inject ONLY for ALU-class ops
+				// AND only if vsetvli was the immediately preceding instruction
+				// (no scalar instructions intervened, e.g. fence/rdcycle from start_timer).
+				// We check this by comparing instruction counts: if vsetvli was
+				// executed exactly 1 instruction before this vector op, it's adjacent.
+				if (pending_vsetvli_) {
+					pending_vsetvli_ = false;
+					uint64_t cur_instr = iss.csrs.instret.reg.val;
+					// Adjacent if exactly 1 instruction between vsetvli and this op
+					bool is_adjacent = (cur_instr - vsetvli_instr_count_) <= 1;
+					
+					if (is_adjacent) {
+						bool is_alu_class = (fu == ara_timing::AraFU::VALU ||
+						                     fu == ara_timing::AraFU::VMFPU_MUL ||
+						                     fu == ara_timing::AraFU::VMFPU_IDIV ||
+						                     fu == ara_timing::AraFU::VREDU_INT ||
+						                     fu == ara_timing::AraFU::VREDU_FP ||
+						                     fu == ara_timing::AraFU::VSLIDE ||
+						                     fu == ara_timing::AraFU::VMASK ||
+						                     fu == ara_timing::AraFU::VNARROW);
+						if (is_alu_class) {
+							uint32_t vsetvli_cost = (timing_model_->getConfig().nr_lanes >= 4) ? 11 : 7;
+							iss.ara_inject_cycles(vsetvli_cost);
+						}
+					}
+				}
+
+				// Compute and inject cycles for the vector instruction itself.
+				// Subtract C_ISS_OVERHEAD only for the FIRST vector op in a
+				// measurement window. Subsequent ops in the same window (e.g.,
+				// vlse followed by vsse) get full injection.
+				static constexpr uint64_t C_ISS_OVERHEAD = 4;
+				uint64_t cycles = timing_model_->computeCycles(desc);
+				uint64_t overhead = first_vec_in_window_ ? C_ISS_OVERHEAD : 0;
+				first_vec_in_window_ = false;
+				if (cycles > overhead) {
+					iss.ara_inject_cycles(cycles - overhead);
+				}
+			} else {
+				// Mark that we just executed a vsetvli; cost will be injected
+				// conditionally with the next vector instruction.
+				pending_vsetvli_ = true;
+				vsetvli_instr_count_ = iss.csrs.instret.reg.val;
+				// vsetvli marks the start of a new measurement window
+				first_vec_in_window_ = true;
+			}
+		}
+
+		current_opId_ = Operation::OpId::NUMBER_OF_OPERATIONS;
 	}
 
 	xlen_reg_t getIntVSew() {
@@ -322,7 +449,14 @@ class VExtension {
 		int8_t signed_vlmul = int8_t(vlmul << 5) >> 5;
 		double lmul = signed_vlmul <= 0 ? 1.0 / (1 << -signed_vlmul) : 1 << signed_vlmul;
 
-		xlen_reg_t vlmax = lmul * VLEN / intVSew;
+		// Use the timing model's configured VLEN for VLMAX computation
+		// when the timing model is active. This ensures the ISS matches
+		// the target hardware's register file capacity.
+		unsigned effective_vlen = VLEN;
+		if (timing_enabled_ && timing_model_) {
+			effective_vlen = timing_model_->getConfig().vlen;
+		}
+		xlen_reg_t vlmax = lmul * effective_vlen / intVSew;
 
 		if (!is_vsetivli) {
 			if (rs1 != 0) {

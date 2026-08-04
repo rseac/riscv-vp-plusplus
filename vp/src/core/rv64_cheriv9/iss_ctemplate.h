@@ -74,6 +74,15 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	VExtension<ISS_CT> v_ext;
 	PrivilegeLevel prv = MachineMode;
 
+	void inject_cycles(uint64_t n) {
+		dbbcache.add_cycle_counter_raw(n * prop_clock_cycle_period.value());
+		commit_cycles();
+	}
+
+
+	__always_inline void ara_inject_cycles(uint64_t n_cycles) {
+		inject_cycles(n_cycles);
+	}
 	ProgramCounterCapability pc;  // TODO: This is a problem for rv32
 	rvfi_dii_trace_t rvfi_dii_output;
 	rvfi_dii_command_t rvfi_dii_input;
