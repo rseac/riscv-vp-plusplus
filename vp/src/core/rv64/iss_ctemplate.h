@@ -137,6 +137,25 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		dbbcache.add_cycle_counter_raw(ps);
 	}
 
+	__always_inline void ara_sync_vector(Operation::OpId opId) {
+		switch (opId) {
+			case Operation::OpId::CSRRS:
+			case Operation::OpId::CSRRW:
+			case Operation::OpId::CSRRC:
+			case Operation::OpId::CSRRSI:
+			case Operation::OpId::CSRRWI:
+			case Operation::OpId::CSRRCI:
+			case Operation::OpId::FENCE:
+			case Operation::OpId::FENCE_I:
+			case Operation::OpId::ECALL:
+			case Operation::OpId::EBREAK:
+				v_ext.syncVector();
+				return;
+			default:
+				break;
+		}
+	}
+
 	/* update instr and cycle counters by local fast counters, update quantum_keeper and reset fast quantum */
 	__always_inline void commit_all_and_reset_fast_quantum(uint64_t &ninstr) {
 		/* commit instructions -> update ninstr to csrs */
@@ -153,6 +172,9 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		ninstr_last = ninstr;
 	}
 
+	__always_inline uint64_t get_clock_cycle_period_ps() {
+		return prop_clock_cycle_period.value();
+	}
 	uint64_t _compute_and_get_current_cycles();
 
 	void init(instr_memory_if *instr_mem, bool use_dbbcache, data_memory_if *data_mem, bool use_lscache,
