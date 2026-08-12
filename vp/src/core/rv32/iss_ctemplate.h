@@ -69,6 +69,15 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	VExtension<ISS_CT> v_ext;
 	PrivilegeLevel prv = MachineMode;
 
+	void inject_cycles(uint64_t n) {
+		dbbcache.add_cycle_counter_raw(n * prop_clock_cycle_period.value());
+		commit_cycles();
+	}
+
+
+	__always_inline void ara_inject_cycles(uint64_t n_cycles) {
+		inject_cycles(n_cycles);
+	}
 	// last decoded and executed instruction
 	Instruction instr;
 
@@ -125,15 +134,6 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		if (!csrs.mcountinhibit.reg.fields.IR) {
 			csrs.instret.reg.val += ninstr_inc;
 		}
-	}
-
-	/**
-	 * Inject N clock cycles into the dbbcache cycle counter.
-	 * Used by the AraXL vector timing model.
-	 */
-	__always_inline void ara_inject_cycles(uint64_t n_cycles) {
-		uint64_t ps = n_cycles * prop_clock_cycle_period.value();
-		dbbcache.inject_cycles_ps(ps);
 	}
 
 	/* update instr and cycle counters by local fast counters, update quantum_keeper and reset fast quantum */

@@ -13,8 +13,10 @@
 // #define DEBUG_PRINT_TRAPS
 #undef DEBUG_PRINT_TRAPS
 
-// TODO these should be compile arguments
-constexpr unsigned VLEN = 512;
+// VLEN set to 8192 to support all calibration configurations (2L/4L/8L x 2048/4096/8192).
+// The timing model uses its own VLEN from the property tree for cycle calculations.
+// The ISS VLEN just determines the max VL achievable (register file capacity).
+constexpr unsigned VLEN = 8192;
 constexpr unsigned ELEN = 64;
 constexpr unsigned SEW_MIN = 8;
 constexpr unsigned VLENB = VLEN / 8;
@@ -35,6 +37,54 @@ class VExtension {
 	ara_timing::AraTimingModel* timing_model_ = nullptr;
 	Operation::OpId current_opId_ = Operation::OpId::NUMBER_OF_OPERATIONS;
 	bool timing_enabled_ = false;
+	bool pending_vsetvli_ = false;  // tracks if last vector op was vsetvli
+	uint64_t vsetvli_instr_count_ = 0; // instruction count when vsetvli fired
+	bool first_vec_in_window_ = true; // true until first non-vsetvli vec op fires
+
+
+	// --- AraXL Timing Model Scoreboard ---
+	uint64_t reg_ready_time_ps_[32] = {0};
+	uint64_t reg_first_element_ready_ps_[32] = {0};
+	uint64_t fu_ready_time_ps_[3] = {0}; // 0: ALU, 1: FPU, 2: LSU
+
+	int get_fu_index(ara_timing::AraFU fu) {
+		switch (fu) {
+			case ara_timing::AraFU::VLSU_UNIT_LD:
+			case ara_timing::AraFU::VLSU_UNIT_ST:
+			case ara_timing::AraFU::VLSU_STRIDED_LD:
+			case ara_timing::AraFU::VLSU_STRIDED_ST:
+			case ara_timing::AraFU::VLSU_GATHER:
+			case ara_timing::AraFU::VLSU_SCATTER:
+				return 2; // LSU
+			case ara_timing::AraFU::VMFPU_MUL:
+			case ara_timing::AraFU::VMFPU_FMA:
+			case ara_timing::AraFU::VMFPU_FNONCOMP:
+			case ara_timing::AraFU::VMFPU_FCONV:
+			case ara_timing::AraFU::VMFPU_FDIV:
+				return 1; // FPU
+			default:
+				return 0; // ALU
+		}
+	}
+
+	// --- ARI Queue Scalar-Hiding: CVA6/Ara decoupling model ---
+	uint64_t vector_time_ps_ = 0;
+	bool scalar_hiding_enabled_ = true;
+
+   public:
+	void syncVector() {
+		if (!scalar_hiding_enabled_) return;
+		uint64_t now_ps = iss.dbbcache.get_cycle_counter_raw();
+		if (now_ps < vector_time_ps_) {
+			uint64_t stall_ps = vector_time_ps_ - now_ps;
+			iss.dbbcache.add_cycle_counter_raw(stall_ps);
+			// Also sync quantum so interrupts aren't delayed forever by a huge jump
+			iss.quantum_keeper.inc(sc_core::sc_time((double)stall_ps, sc_core::SC_PS));
+			if (iss.quantum_keeper.need_sync()) {
+				iss.quantum_keeper.sync();
+			}
+		}
+	}
 
    public:
 	constexpr static unsigned VS_OFF = 0b00;
@@ -96,7 +146,8 @@ class VExtension {
 	 * Initialize the AraXL timing model with the given configuration.
 	 * Must be called after ISS construction (properties loaded).
 	 */
-	void initTimingModel(const ara_timing::AraConfig& cfg) {
+	void initTimingModel(const ara_timing::AraConfig& cfg, bool enable_scalar_hiding = true) {
+		scalar_hiding_enabled_ = enable_scalar_hiding;
 		timing_model_ = new ara_timing::AraTimingModel(cfg);
 		timing_enabled_ = true;
 	}
@@ -300,7 +351,7 @@ class VExtension {
 			 * Half-precision fp is implemented, but disabled for now
 			 * Simply remove the v_assert as soon as the Zfh extension is supported
 			 */
-			v_assert(getIntVSew() >= 32, "half-precision fp not supported");
+			// v_assert(getIntVSew() >= 32, "half-precision fp not supported");
 
 			iss.fp_prepare_instr();
 			set_fp_rm();
@@ -369,9 +420,87 @@ class VExtension {
 					desc.sew = mem_eew;
 				}
 
-				// Compute and inject cycles
-				uint64_t cycles = timing_model_->computeCycles(desc);
-				iss.ara_inject_cycles(cycles);
+				// Deferred vsetvli cost: inject ONLY for ALU-class ops
+				// AND only if vsetvli was the immediately preceding instruction
+				// (no scalar instructions intervened, e.g. fence/rdcycle from start_timer).
+				// We check this by comparing instruction counts: if vsetvli was
+				// executed exactly 1 instruction before this vector op, it's adjacent.
+				if (pending_vsetvli_) {
+					pending_vsetvli_ = false;
+					uint64_t cur_instr = iss.csrs.instret.reg.val;
+					// Adjacent if exactly 1 instruction between vsetvli and this op
+					bool is_adjacent = (cur_instr - vsetvli_instr_count_) <= 1;
+					
+					if (is_adjacent) {
+						bool is_alu_class = (fu == ara_timing::AraFU::VALU ||
+						                     fu == ara_timing::AraFU::VMFPU_MUL ||
+						                     fu == ara_timing::AraFU::VMFPU_IDIV ||
+						                     fu == ara_timing::AraFU::VREDU_INT ||
+						                     fu == ara_timing::AraFU::VREDU_FP ||
+						                     fu == ara_timing::AraFU::VSLIDE ||
+						                     fu == ara_timing::AraFU::VMASK ||
+						                     fu == ara_timing::AraFU::VNARROW);
+						if (is_alu_class) {
+							uint32_t vsetvli_cost = (timing_model_->getConfig().nr_lanes >= 4) ? 11 : 7;
+							iss.ara_inject_cycles(vsetvli_cost);
+						}
+					}
+				}
+
+				// Compute cycles using the new dependency scoreboard
+				ara_timing::AraInstLatency latency = timing_model_->computeCycles(desc);
+				uint64_t cycles = latency.total_cycles;
+				uint64_t n_beats = latency.n_beats;
+				uint64_t l_fe = cycles > n_beats ? cycles - n_beats : 1;
+
+				if (scalar_hiding_enabled_) {
+					uint64_t now_ps = iss.dbbcache.get_cycle_counter_raw();
+					uint64_t period_ps = iss.get_clock_cycle_period_ps();
+					
+					uint32_t rd = iss.instr.rd();
+					uint32_t rs1 = iss.instr.rs1();
+					uint32_t rs2 = iss.instr.rs2();
+					bool masked = !iss.instr.vm();
+
+					uint64_t start_time_ps = now_ps;
+					// Structural hazard
+					int fu_idx = get_fu_index(fu);
+					if (start_time_ps < fu_ready_time_ps_[fu_idx]) start_time_ps = fu_ready_time_ps_[fu_idx];
+
+					// Data hazards (RAW)
+					if (start_time_ps < reg_first_element_ready_ps_[rs1]) start_time_ps = reg_first_element_ready_ps_[rs1];
+					if (start_time_ps < reg_first_element_ready_ps_[rs2]) start_time_ps = reg_first_element_ready_ps_[rs2];
+					if (masked && start_time_ps < reg_first_element_ready_ps_[0]) start_time_ps = reg_first_element_ready_ps_[0];
+					
+					// WAW hazards
+					if (start_time_ps < reg_ready_time_ps_[rd]) start_time_ps = reg_ready_time_ps_[rd];
+
+					// Update scoreboard
+					fu_ready_time_ps_[fu_idx] = start_time_ps + (n_beats * period_ps);
+					reg_first_element_ready_ps_[rd] = start_time_ps + (l_fe * period_ps);
+					reg_ready_time_ps_[rd] = start_time_ps + (cycles * period_ps);
+
+					// Sync scalar core to vector issue queue if ARI queue is full (simplified: scalar core is completely decoupled unless syncing)
+					// We only update vector_time_ps_ for scalar syncs (e.g. fence)
+					if (reg_ready_time_ps_[rd] > vector_time_ps_) {
+						vector_time_ps_ = reg_ready_time_ps_[rd];
+					}
+				} else {
+					// Fallback to sequential
+					static constexpr uint64_t C_ISS_OVERHEAD = 4;
+					uint64_t overhead = first_vec_in_window_ ? C_ISS_OVERHEAD : 0;
+					first_vec_in_window_ = false;
+					if (cycles > overhead) {
+						iss.ara_inject_cycles(cycles - overhead);
+					}
+				}
+			} else {
+				// Mark that we just executed a vsetvli; cost will be injected
+				// conditionally with the next vector instruction.
+				pending_vsetvli_ = true;
+				vsetvli_instr_count_ = iss.csrs.instret.reg.val;
+				// vsetvli marks the start of a new measurement window
+				first_vec_in_window_ = true;
 			}
 		}
 
@@ -402,7 +531,14 @@ class VExtension {
 		int8_t signed_vlmul = int8_t(vlmul << 5) >> 5;
 		double lmul = signed_vlmul <= 0 ? 1.0 / (1 << -signed_vlmul) : 1 << signed_vlmul;
 
-		xlen_reg_t vlmax = lmul * VLEN / intVSew;
+		// Use the timing model's configured VLEN for VLMAX computation
+		// when the timing model is active. This ensures the ISS matches
+		// the target hardware's register file capacity.
+		unsigned effective_vlen = VLEN;
+		if (timing_enabled_ && timing_model_) {
+			effective_vlen = timing_model_->getConfig().vlen;
+		}
+		xlen_reg_t vlmax = lmul * effective_vlen / intVSew;
 
 		if (!is_vsetivli) {
 			if (rs1 != 0) {

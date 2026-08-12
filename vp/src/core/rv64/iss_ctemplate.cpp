@@ -357,13 +357,18 @@ void *ISS_CT::genOpMap() {
 	assert(((pc & ~pc_alignment_mask()) == 0) && "misaligned instruction"); \
 	stats.inc_cnt();                                                        \
 	stats.inc_slow_fdd();                                                   \
-	void *opLabelPtr = dbbcache.fetch_decode(pc, instr);                    \
-	if (trace) {                                                            \
-		print_trace();                                                      \
-		/* always stay in slow path if trace enabled */                     \
-		force_slow_path();                                                  \
-	}                                                                       \
-	goto *opLabelPtr;
+	{                                                                       \
+		void *opLabelPtr = dbbcache.fetch_decode(pc, instr);                \
+		Operation::OpId _decoded_opId = instr.decode_normal(ARCH,           \
+		    *isa_config);                                                   \
+		ara_sync_vector(_decoded_opId);                                     \
+		if (trace) {                                                        \
+			print_trace();                                                  \
+			/* always stay in slow path if trace enabled */                 \
+			force_slow_path();                                              \
+		}                                                                   \
+		goto *opLabelPtr;                                                   \
+	}
 
 #define GOTO_OP_MED_FDD() \
 	stats.inc_cnt();      \

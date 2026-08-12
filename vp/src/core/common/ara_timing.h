@@ -94,6 +94,11 @@ struct AraConfig {
 	      c_fe_fpu_ew64(5) {}
 };
 
+struct AraInstLatency {
+	uint64_t total_cycles;
+	uint64_t n_beats; // fu_busy_time
+};
+
 /*
  * Main timing engine class
  */
@@ -105,7 +110,7 @@ class AraTimingModel {
 	 * Compute the cycle count for a given vector instruction descriptor.
 	 * This is the primary entry point called from VExtension::finishInstr().
 	 */
-	uint64_t computeCycles(const AraVecInsn& desc) const;
+	AraInstLatency computeCycles(const AraVecInsn& desc) const;
 
 	/*
 	 * Compute only the pipeline overhead for memory operations
@@ -185,6 +190,18 @@ class AraTimingModel {
 	uint64_t computeSlide(const AraVecInsn& desc) const;
 	uint64_t computeNarrow(const AraVecInsn& desc) const;
 	uint64_t computeMask(const AraVecInsn& desc) const;
+	uint64_t lookupRTL(const AraVecInsn& desc) const;
+
+	// RTL calibration values per (NrLanes, VLEN) configuration
+	uint32_t rtl_fpu_ew32_vl16_, rtl_fpu_ew32_vl256_, rtl_fpu_ew32_vl1024_;
+	uint32_t rtl_fpu_ew64_vl16_, rtl_fpu_ew64_vl256_, rtl_fpu_ew64_vl1024_;
+	uint32_t rtl_valu_add_m1_vl16_, rtl_valu_add_m1_vl256_, rtl_valu_add_m1_vl1024_;
+	uint32_t rtl_valu_add_m2_vl16_, rtl_valu_add_m2_vl256_, rtl_valu_add_m2_vl1024_;
+	uint32_t rtl_valu_add_m8_vl16_, rtl_valu_add_m8_vl256_;
+	uint32_t rtl_valu_mul_vl16_, rtl_valu_mul_vl256_, rtl_valu_mul_vl1024_;
+	uint32_t rtl_valu_div_vl16_, rtl_valu_div_vl256_;
+	uint32_t rtl_valu_redsum_vl16_, rtl_valu_redsum_vl256_;
+	uint32_t rtl_vlsu_stride_vl16_, rtl_vlsu_stride_vl256_, rtl_vlsu_stride_vl1024_;
 };
 
 }  // namespace ara_timing
