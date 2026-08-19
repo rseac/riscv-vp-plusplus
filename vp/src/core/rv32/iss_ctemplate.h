@@ -175,6 +175,7 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 
 	uint64_t get_progam_counter(void) override;
 	void enable_debug(void) override;
+	__always_inline uint64_t get_clock_cycle_period_ps() { return prop_clock_cycle_period.value(); }
 
 	void enable_trace(bool ena) override {
 		trace = ena;

@@ -94,6 +94,11 @@ struct AraConfig {
 	      c_fe_fpu_ew64(5) {}
 };
 
+struct AraInstLatency {
+	uint64_t total_cycles;
+	uint64_t n_beats; // fu_busy_time
+};
+
 /*
  * Main timing engine class
  */
@@ -105,7 +110,7 @@ class AraTimingModel {
 	 * Compute the cycle count for a given vector instruction descriptor.
 	 * This is the primary entry point called from VExtension::finishInstr().
 	 */
-	uint64_t computeCycles(const AraVecInsn& desc) const;
+	AraInstLatency computeCycles(const AraVecInsn& desc) const;
 
 	/*
 	 * Compute only the pipeline overhead for memory operations

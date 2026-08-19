@@ -175,6 +175,7 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	void clear_timer_interrupt() override;
 
 	void trigger_software_interrupt() override;
+	__always_inline uint64_t get_clock_cycle_period_ps() { return prop_clock_cycle_period.value(); }
 	void clear_software_interrupt() override;
 
 	void sys_exit() override;

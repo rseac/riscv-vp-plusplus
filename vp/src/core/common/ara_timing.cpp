@@ -493,86 +493,102 @@ uint64_t AraTimingModel::lookupRTL(const AraVecInsn& desc) const {
 // ============================================================================
 // Main dispatch: computeCycles
 // ============================================================================
-uint64_t AraTimingModel::computeCycles(const AraVecInsn& desc) const {
-	if (desc.vl == 0) return 1;  // vl=0: no-op, just dispatch overhead
+AraInstLatency AraTimingModel::computeCycles(const AraVecInsn& desc) const {
+	AraInstLatency result;
+	uint64_t total = 0;
+	if (desc.vl == 0) return {1, 1};  // vl=0: no-op, just dispatch overhead
 	
 	// Try RTL lookup first for exact calibration
 	uint64_t rtl_val = lookupRTL(desc);
-	if (rtl_val > 0) return rtl_val;
+	if (rtl_val > 0) return {rtl_val, rtl_val};
 
 	switch (desc.fu) {
 		case AraFU::VALU:
-			return computeALU(desc);
+			total = computeALU(desc); break;
 
 		case AraFU::VMFPU_MUL:
-			return computeMUL(desc);
+			total = computeMUL(desc); break;
 
 		case AraFU::VMFPU_FMA:
-			return computeFPFMA(desc);
+			total = computeFPFMA(desc); break;
 
 		case AraFU::VMFPU_FNONCOMP:
-			return computeFPNonComp(desc);
+			total = computeFPNonComp(desc); break;
 
 		case AraFU::VMFPU_FCONV:
-			return computeFPConv(desc);
+			total = computeFPConv(desc); break;
 
 		case AraFU::VMFPU_FDIV:
 			// Use FP pipeline + serial divider approximation
-			return computeIDIV(desc);
+			total = computeIDIV(desc); break;
 
 		case AraFU::VMFPU_IDIV:
-			return computeIDIV(desc);
+			total = computeIDIV(desc); break;
 
 		case AraFU::VLSU_UNIT_LD:
-			return computeUnitLoad(desc);
+			total = computeUnitLoad(desc); break;
 
 		case AraFU::VLSU_UNIT_ST:
-			return computeUnitStore(desc);
+			total = computeUnitStore(desc); break;
 
 		case AraFU::VLSU_STRIDED_LD:
-			return computeStridedLoad(desc);
+			total = computeStridedLoad(desc); break;
 
 		case AraFU::VLSU_STRIDED_ST:
-			return computeStridedStore(desc);
+			total = computeStridedStore(desc); break;
 
 		case AraFU::VLSU_GATHER:
-			return computeGather(desc);
+			total = computeGather(desc); break;
 
 		case AraFU::VLSU_SCATTER:
-			return computeScatter(desc);
+			total = computeScatter(desc); break;
 
 		case AraFU::VREDU_INT:
-			return computeReduction(desc, false);
+			total = computeReduction(desc, false); break;
 
 		case AraFU::VREDU_FP:
-			return computeReduction(desc, true);
+			total = computeReduction(desc, true); break;
 
 		case AraFU::VSLIDE:
-			return computeSlide(desc);
+			total = computeSlide(desc); break;
 
 		case AraFU::VNARROW:
-			return computeNarrow(desc);
+			total = computeNarrow(desc); break;
 
 		case AraFU::VMASK:
-			return computeMask(desc);
+			total = computeMask(desc); break;
 
 		case AraFU::VMV:
 			// Scalar move: minimal latency, just front-end
-			return getALUFrontEnd();
+			total = getALUFrontEnd(); break;
 
 		case AraFU::VSETVL:
 			// vsetvl is handled by scalar core, not accelerator
-			return 1;
+			return {1, 1};
 
 		case AraFU::VWHOLE_REG:
 			// Whole register load/store: similar to unit-stride
-			return computeUnitLoad(desc);
+			total = computeUnitLoad(desc); break;
 
 		case AraFU::UNKNOWN:
 		default:
 			// Fallback: use ALU model
-			return computeALU(desc);
+			total = computeALU(desc); break;
+
 	}
+	
+	result.total_cycles = total;
+	
+	if (desc.fu == AraFU::VLSU_GATHER || desc.fu == AraFU::VLSU_SCATTER ||
+	    desc.fu == AraFU::VLSU_STRIDED_LD || desc.fu == AraFU::VLSU_STRIDED_ST ||
+	    desc.fu == AraFU::VMFPU_FDIV || desc.fu == AraFU::VMFPU_IDIV) {
+		result.n_beats = total;
+	} else {
+		uint32_t n = desc.vl > 0 ? (desc.vl * desc.sew + (cfg_.nr_lanes * 64) - 1) / (cfg_.nr_lanes * 64) : 0;
+		result.n_beats = n > 0 ? n : 1;
+	}
+	
+	return result;
 }
 
 // ============================================================================
@@ -611,7 +627,7 @@ uint64_t AraTimingModel::computePipelineOverhead(const AraVecInsn& desc) const {
 			return computeGather(desc);
 
 		default:
-			return computeCycles(desc);
+			return computeCycles(desc).total_cycles;
 	}
 }
 
