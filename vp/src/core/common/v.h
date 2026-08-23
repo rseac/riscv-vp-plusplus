@@ -2,6 +2,7 @@
 #include <boost/format.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cstring>
+#include <deque>
 
 #include "ara_timing.h"
 #include "ara_timing_classify.h"
@@ -46,6 +47,10 @@ class VExtension {
 	uint64_t reg_ready_time_ps_[32] = {0};
 	uint64_t reg_first_element_ready_ps_[32] = {0};
 	uint64_t fu_ready_time_ps_[3] = {0}; // 0: ALU, 1: FPU, 2: LSU
+
+	// Vector Issue Queue for structural scalar stalls
+	std::deque<uint64_t> vector_issue_queue_;
+	const size_t MAX_VIQ_DEPTH = 4; // Ara has a 4-entry instruction queue
 
 	int get_fu_index(ara_timing::AraFU fu) {
 		switch (fu) {
@@ -162,6 +167,11 @@ class VExtension {
 	 */
 	void setCurrentOpId(Operation::OpId opId) {
 		current_opId_ = opId;
+	}
+
+	template <typename T>
+	void setCurrentOpId(T opId) {
+		current_opId_ = static_cast<Operation::OpId>(opId);
 	}
 
 	/**
@@ -335,6 +345,27 @@ class VExtension {
 	}
 
 	void prepInstr(bool require_not_off, bool require_vill, bool is_fp) {
+		if (scalar_hiding_enabled_ && timing_enabled_ && timing_model_) {
+			uint64_t now_ps = iss.dbbcache.get_cycle_counter_raw();
+
+			// Clean up retired instructions
+			while (!vector_issue_queue_.empty() && vector_issue_queue_.front() <= now_ps) {
+				vector_issue_queue_.pop_front();
+			}
+
+			// If issue queue is full, scalar core must stall
+			if (vector_issue_queue_.size() >= MAX_VIQ_DEPTH) {
+				uint64_t oldest_retire_time = vector_issue_queue_.front();
+				if (now_ps < oldest_retire_time) {
+					uint64_t stall_ps = oldest_retire_time - now_ps;
+					uint64_t period_ps = iss.get_clock_cycle_period_ps();
+					uint64_t stall_cycles = (stall_ps + period_ps - 1) / period_ps;
+					iss.ara_inject_cycles(stall_cycles);
+				}
+				vector_issue_queue_.pop_front();
+			}
+		}
+
 		if (require_not_off) {
 			requireNotOff();
 		}
@@ -479,6 +510,9 @@ class VExtension {
 					fu_ready_time_ps_[fu_idx] = start_time_ps + (n_beats * period_ps);
 					reg_first_element_ready_ps_[rd] = start_time_ps + (l_fe * period_ps);
 					reg_ready_time_ps_[rd] = start_time_ps + (cycles * period_ps);
+
+					// Push the completion time into the issue queue
+					vector_issue_queue_.push_back(reg_ready_time_ps_[rd]);
 
 					// Sync scalar core to vector issue queue if ARI queue is full (simplified: scalar core is completely decoupled unless syncing)
 					// We only update vector_time_ps_ for scalar syncs (e.g. fence)

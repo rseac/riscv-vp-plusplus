@@ -152,6 +152,9 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		ninstr_last = ninstr;
 	}
 
+	__always_inline uint64_t get_clock_cycle_period_ps() {
+		return prop_clock_cycle_period.value();
+	}
 	uint64_t _compute_and_get_current_cycles();
 
 	void init(instr_memory_if *instr_mem, bool use_dbbcache, data_memory_if *data_mem, bool use_lscache,

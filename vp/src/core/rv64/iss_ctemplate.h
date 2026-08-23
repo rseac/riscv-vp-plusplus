@@ -139,6 +139,9 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 
 	__always_inline void ara_sync_vector(Operation::OpId opId) {
 		switch (opId) {
+			case Operation::OpId::VFMV_F_S:
+			case Operation::OpId::VMV_X_S:
+			case Operation::OpId::VFIRST_M:
 			case Operation::OpId::CSRRS:
 			case Operation::OpId::CSRRW:
 			case Operation::OpId::CSRRC:
