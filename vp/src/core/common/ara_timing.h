@@ -38,4 +38,5 @@ public:
 
     uint64_t computeCycles(const AraVecInsn& desc);
     uint64_t computePipelineOverhead(const AraVecInsn& desc);
+    uint64_t computeIssueLatency(const AraVecInsn& desc);
 };

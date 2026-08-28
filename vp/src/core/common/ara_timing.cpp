@@ -76,3 +76,7 @@ uint64_t AraTimingModel::computeCycles(const AraVecInsn& desc) {
 uint64_t AraTimingModel::computePipelineOverhead(const AraVecInsn& desc) {
     return computeCycles(desc);
 }
+
+uint64_t AraTimingModel::computeIssueLatency(const AraVecInsn& desc) {
+    return 1;
+}

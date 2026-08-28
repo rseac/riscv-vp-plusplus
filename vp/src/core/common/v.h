@@ -318,6 +318,12 @@ class VExtension {
     }
     
     void prepInstr(bool require_not_off, bool require_vill, bool is_fp, Operation::OpId opId) {
+        if (timing_enabled_) {
+            uint64_t now = iss.get_cycle_count();
+            if (now < vector_busy_until_cycle_) {
+                iss.inject_cycles(vector_busy_until_cycle_ - now);
+            }
+        }
         current_opId_ = opId;
         has_current_opId_ = true;
 
@@ -387,7 +393,7 @@ class VExtension {
 			uint64_t now = iss.get_cycle_count();
 			vector_busy_until_cycle_ = now + cycles;
             std::cout << "DEBUG: vl=" << desc.vl << " sew=" << desc.ew << " lmul=" << desc.lmul << " cycles=" << cycles << std::endl;
-			iss.inject_cycles(cycles);
+			iss.inject_cycles(timing_model_->computeIssueLatency(desc));
 		}
 	}
 
