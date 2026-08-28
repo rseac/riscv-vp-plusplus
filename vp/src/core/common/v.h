@@ -26,11 +26,64 @@ typedef int64_t s_op_reg_t;
 template <typename iss_type>
 class VExtension {
    private:
-    uint64_t vector_busy_until_cycle_ = 0;
+    uint64_t vreg_ready_cycle_[32] = {0};
     bool timing_enabled_ = false;
     AraTimingModel* timing_model_ = nullptr;
     Operation::OpId current_opId_;
     bool has_current_opId_ = false;
+
+    std::vector<uint32_t> get_accessed_vregs() const {
+        std::vector<uint32_t> regs;
+        uint32_t insn = iss.instr.data();
+        uint32_t opcode = insn & 0x7F;
+        uint32_t rd = (insn >> 7) & 0x1F;
+        uint32_t rs1 = (insn >> 15) & 0x1F;
+        uint32_t rs2 = (insn >> 20) & 0x1F;
+        uint32_t vm = (insn >> 25) & 0x1;
+        uint32_t funct3 = (insn >> 12) & 0x7;
+        uint32_t mop = (insn >> 26) & 0x3;
+        
+        uint32_t vlmul_enc = iss.csrs.vtype.reg.fields.vlmul;
+        int8_t signed_vlmul = int8_t(vlmul_enc << 5) >> 5;
+        uint32_t n_regs = 1;
+        if (signed_vlmul > 0) {
+            n_regs = 1 << signed_vlmul;
+        }
+        
+        auto add_reg_group = [&](uint32_t base, uint32_t count) {
+            for (uint32_t i = 0; i < count; i++) {
+                if (base + i < 32) regs.push_back(base + i);
+            }
+        };
+
+        bool is_vector_insn = false;
+        if (opcode == 0x57 && funct3 != 7) {
+            is_vector_insn = true;
+            add_reg_group(rd, n_regs);
+            add_reg_group(rs2, n_regs);
+            if (funct3 == 0 || funct3 == 1 || funct3 == 2) {
+                add_reg_group(rs1, n_regs);
+            }
+        } else if (opcode == 0x07) {
+            is_vector_insn = true;
+            add_reg_group(rd, n_regs);
+            if (mop == 1 || mop == 3) {
+                add_reg_group(rs2, n_regs);
+            }
+        } else if (opcode == 0x27) {
+            is_vector_insn = true;
+            add_reg_group(rd, n_regs);
+            if (mop == 1 || mop == 3) {
+                add_reg_group(rs2, n_regs);
+            }
+        }
+        
+        if (is_vector_insn && vm == 0) {
+            regs.push_back(0);
+        }
+        
+        return regs;
+    }
 
    public:
     void initTiming(bool enabled, uint32_t lanes, uint32_t vlen, uint32_t tau_mem, uint32_t c_sync) {
@@ -50,7 +103,11 @@ class VExtension {
     
     bool timingEnabled() const { return timing_enabled_; }
     bool isVectorBusy(uint64_t current_cycle) const {
-        return timing_enabled_ && current_cycle < vector_busy_until_cycle_;
+        if (!timing_enabled_) return false;
+        for (int i = 0; i < 32; i++) {
+            if (current_cycle < vreg_ready_cycle_[i]) return true;
+        }
+        return false;
     }
     
     AraFU classifyFU(Operation::OpId opId) const {
@@ -320,8 +377,15 @@ class VExtension {
     void prepInstr(bool require_not_off, bool require_vill, bool is_fp, Operation::OpId opId) {
         if (timing_enabled_) {
             uint64_t now = iss.get_cycle_count();
-            if (now < vector_busy_until_cycle_) {
-                iss.inject_cycles(vector_busy_until_cycle_ - now);
+            uint64_t max_ready = 0;
+            std::vector<uint32_t> regs = get_accessed_vregs();
+            for (uint32_t r : regs) {
+                if (vreg_ready_cycle_[r] > max_ready) {
+                    max_ready = vreg_ready_cycle_[r];
+                }
+            }
+            if (now < max_ready) {
+                iss.inject_cycles(max_ready - now);
             }
         }
         current_opId_ = opId;
@@ -391,7 +455,10 @@ class VExtension {
 			}
 			
 			uint64_t now = iss.get_cycle_count();
-			vector_busy_until_cycle_ = now + cycles;
+            std::vector<uint32_t> regs = get_accessed_vregs();
+            for (uint32_t r : regs) {
+                vreg_ready_cycle_[r] = now + cycles;
+            }
             std::cout << "DEBUG: vl=" << desc.vl << " sew=" << desc.ew << " lmul=" << desc.lmul << " cycles=" << cycles << std::endl;
 			iss.inject_cycles(timing_model_->computeIssueLatency(desc));
 		}
