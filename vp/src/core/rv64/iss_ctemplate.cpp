@@ -43,6 +43,19 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 	/* get config properties from global property tree (or use default) */
 	VPPP_PROPERTY_GET("ISS." + name(), "clock_cycle_period", sc_core::sc_time, prop_clock_cycle_period);
 
+	uint64_t ara_timing_enabled = 0;
+	VPPP_PROPERTY_GET("ISS." + name(), "ara_timing_enabled", uint64_t, ara_timing_enabled);
+	uint64_t ara_nr_lanes = 4;
+	VPPP_PROPERTY_GET("ISS." + name(), "ara_nr_lanes", uint64_t, ara_nr_lanes);
+	uint64_t ara_vlen = 4096;
+	VPPP_PROPERTY_GET("ISS." + name(), "ara_vlen", uint64_t, ara_vlen);
+	uint64_t ara_tau_mem = 10;
+	VPPP_PROPERTY_GET("ISS." + name(), "ara_tau_mem", uint64_t, ara_tau_mem);
+	uint64_t ara_c_harness = 6;
+	VPPP_PROPERTY_GET("ISS." + name(), "ara_c_harness", uint64_t, ara_c_harness);
+	
+	v_ext.initTiming(ara_timing_enabled != 0, ara_nr_lanes, ara_vlen, ara_tau_mem, ara_c_harness);
+
 	sc_core::sc_time qt = tlm::tlm_global_quantum::instance().get();
 
 	assert(qt >= prop_clock_cycle_period);
@@ -161,6 +174,10 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 
 		/* set instruction time */
 		opMap[opId].instr_time = instr_clock_cycles * prop_clock_cycle_period.value(); /* ps */
+	}
+
+	for (unsigned int opId = Operation::OpId::VSETVLI; opId < Operation::OpId::NUMBER_OF_OPERATIONS; ++opId) {
+		opMap[opId].instr_time = 0;  // Vector timing handled dynamically
 	}
 }
 
@@ -333,11 +350,21 @@ void *ISS_CT::genOpMap() {
 	OP_LABEL(op_global_fast_finalize_and_fdd) : __attribute__((unused));           \
 	{OP_FAST_FINALIZE_AND_FDD()}
 
+static inline bool is_vector_op(Operation::OpId opId) {
+    return opId >= Operation::OpId::VSETVLI && opId < Operation::OpId::NUMBER_OF_OPERATIONS;
+}
+
 #define OP_CASE(_op)                                                                                                 \
 	OP_LABEL_OP(_op)                                                                                                 \
 	    : static struct op_label_entry OP_LABEL_ENTRY_OP(_op)                                                        \
 	          __attribute__((used, section(OP_LABLE_ENTRIES_SEC_STR))) = {Operation::OpId::_op, &&OP_LABEL_OP(_op)}; \
-	stats.inc_op(Operation::OpId::_op);
+	stats.inc_op(Operation::OpId::_op); \
+	if (v_ext.timingEnabled() && !is_vector_op(Operation::OpId::_op)) { \
+		uint64_t now = dbbcache.get_cycle_counter_raw() / prop_clock_cycle_period.value(); \
+		if (v_ext.isVectorBusy(now)) { \
+			dbbcache.inject_cycles(- (int64_t)opMap[Operation::OpId::_op].instr_time); \
+		} \
+	}
 
 #define OP_INVALID_END()                                                                                             \
 	if (trace) {                                                                                                     \
@@ -2277,21 +2304,21 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				 * Note: handling of x0/zero is done in v_ext implementation (writes to zero/x0 are ignored)
 				 */
 				OP_CASE(VSETVLI) {
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VSETVLI);
 					v_ext.v_set_operation(instr.rd(), instr.rs1(), instr.zimm_10(), 0);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSETIVLI) {
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VSETIVLI);
 					v_ext.v_set_operation(instr.rd(), 0, instr.zimm_9(), instr.rs1());
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSETVL) {
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VSETVL);
 					v_ext.v_set_operation(instr.rd(), instr.rs1(), regs[instr.rs2()], 0);
 					v_ext.finishInstr(false);
 				}
@@ -2299,7 +2326,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLM_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLM_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::masked);
 					v_ext.finishInstr(false);
 				}
@@ -2307,7 +2334,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSM_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSM_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::masked);
 					v_ext.finishInstr(false);
 				}
@@ -2315,7 +2342,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLE8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLE8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2323,7 +2350,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLE16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLE16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2331,7 +2358,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLE32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLE32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2339,7 +2366,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLE64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLE64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2347,7 +2374,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSE8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSE8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2355,7 +2382,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSE16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSE16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2363,7 +2390,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSE32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSE32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2371,7 +2398,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSE64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSE64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2379,7 +2406,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSE8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSE8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2387,7 +2414,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSE16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSE16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2395,7 +2422,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSE32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSE32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2403,7 +2430,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSE64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSE64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2411,7 +2438,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSE8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSE8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2419,7 +2446,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSE16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSE16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2427,7 +2454,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSE32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSE32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2435,7 +2462,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSE64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSE64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2443,7 +2470,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXEI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXEI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2451,7 +2478,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXEI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXEI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2459,7 +2486,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXEI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXEI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2467,7 +2494,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXEI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXEI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2475,7 +2502,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXEI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXEI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2483,7 +2510,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXEI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXEI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2491,7 +2518,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXEI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXEI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2499,7 +2526,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXEI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXEI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2507,7 +2534,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXEI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXEI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2515,7 +2542,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXEI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXEI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2523,7 +2550,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXEI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXEI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2531,7 +2558,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXEI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXEI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2539,7 +2566,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXEI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXEI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2547,7 +2574,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXEI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXEI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2555,7 +2582,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXEI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXEI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2563,7 +2590,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXEI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXEI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2571,7 +2598,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLE8FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLE8FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -2579,7 +2606,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLE16FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLE16FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -2587,7 +2614,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLE32FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLE32FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -2595,7 +2622,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLE64FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLE64FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -2603,7 +2630,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG2E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG2E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2611,7 +2638,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG2E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG2E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2619,7 +2646,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG2E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG2E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2627,7 +2654,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG2E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG2E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2635,7 +2662,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG2E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG2E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2643,7 +2670,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG2E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG2E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2651,7 +2678,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG2E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG2E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2659,7 +2686,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG2E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG2E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2667,7 +2694,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG2E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG2E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2675,7 +2702,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG2E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG2E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2683,7 +2710,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG2E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG2E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2691,7 +2718,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG2E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG2E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2699,7 +2726,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG2E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG2E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2707,7 +2734,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG2E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG2E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2715,7 +2742,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG2E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG2E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2723,7 +2750,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG2E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG2E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2731,7 +2758,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG2EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG2EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2739,7 +2766,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG2EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG2EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2747,7 +2774,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG2EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG2EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2755,7 +2782,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG2EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG2EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2763,7 +2790,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG2EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG2EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2771,7 +2798,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG2EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG2EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2779,7 +2806,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG2EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG2EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2787,7 +2814,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG2EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG2EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2795,7 +2822,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG2EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG2EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2803,7 +2830,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG2EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG2EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2811,7 +2838,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG2EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG2EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2819,7 +2846,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG2EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG2EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2827,7 +2854,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG2EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG2EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2835,7 +2862,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG2EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG2EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2843,7 +2870,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG2EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG2EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2851,7 +2878,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG2EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG2EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -2859,7 +2886,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG2E8FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG2E8FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -2867,7 +2894,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG2E16FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG2E16FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -2875,7 +2902,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG2E32FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG2E32FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -2883,7 +2910,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG2E64FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG2E64FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -2891,7 +2918,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG3E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG3E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2899,7 +2926,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG3E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG3E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2907,7 +2934,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG3E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG3E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2915,7 +2942,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG3E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG3E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2923,7 +2950,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG3E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG3E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2931,7 +2958,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG3E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG3E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2939,7 +2966,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG3E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG3E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2947,7 +2974,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG3E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG3E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -2955,7 +2982,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG3E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG3E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2963,7 +2990,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG3E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG3E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2971,7 +2998,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG3E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG3E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2979,7 +3006,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG3E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG3E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2987,7 +3014,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG3E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG3E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -2995,7 +3022,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG3E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG3E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3003,7 +3030,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG3E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG3E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3011,7 +3038,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG3E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG3E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3019,7 +3046,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG3EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG3EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3027,7 +3054,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG3EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG3EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3035,7 +3062,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG3EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG3EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3043,7 +3070,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG3EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG3EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3051,7 +3078,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG3EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG3EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3059,7 +3086,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG3EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG3EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3067,7 +3094,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG3EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG3EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3075,7 +3102,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG3EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG3EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3083,7 +3110,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG3EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG3EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3091,7 +3118,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG3EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG3EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3099,7 +3126,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG3EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG3EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3107,7 +3134,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG3EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG3EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3115,7 +3142,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG3EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG3EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3123,7 +3150,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG3EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG3EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3131,7 +3158,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG3EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG3EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3139,7 +3166,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG3EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG3EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3147,7 +3174,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG3E8FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG3E8FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -3155,7 +3182,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG3E16FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG3E16FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -3163,7 +3190,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG3E32FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG3E32FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -3171,7 +3198,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG3E64FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG3E64FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -3179,7 +3206,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG4E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG4E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3187,7 +3214,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG4E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG4E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3195,7 +3222,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG4E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG4E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3203,7 +3230,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG4E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG4E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3211,7 +3238,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG4E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG4E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3219,7 +3246,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG4E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG4E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3227,7 +3254,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG4E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG4E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3235,7 +3262,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG4E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG4E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3243,7 +3270,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG4E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG4E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3251,7 +3278,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG4E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG4E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3259,7 +3286,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG4E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG4E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3267,7 +3294,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG4E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG4E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3275,7 +3302,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG4E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG4E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3283,7 +3310,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG4E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG4E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3291,7 +3318,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG4E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG4E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3299,7 +3326,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG4E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG4E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3307,7 +3334,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG4EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG4EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3315,7 +3342,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG4EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG4EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3323,7 +3350,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG4EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG4EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3331,7 +3358,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG4EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG4EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3339,7 +3366,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG4EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG4EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3347,7 +3374,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG4EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG4EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3355,7 +3382,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG4EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG4EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3363,7 +3390,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG4EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG4EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3371,7 +3398,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG4EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG4EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3379,7 +3406,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG4EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG4EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3387,7 +3414,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG4EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG4EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3395,7 +3422,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG4EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG4EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3403,7 +3430,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG4EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG4EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3411,7 +3438,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG4EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG4EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3419,7 +3446,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG4EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG4EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3427,7 +3454,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG4EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG4EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3435,7 +3462,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG4E8FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG4E8FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -3443,7 +3470,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG4E16FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG4E16FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -3451,7 +3478,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG4E32FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG4E32FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -3459,7 +3486,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG4E64FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG4E64FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -3467,7 +3494,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG5E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG5E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3475,7 +3502,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG5E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG5E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3483,7 +3510,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG5E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG5E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3491,7 +3518,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG5E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG5E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3499,7 +3526,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG5E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG5E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3507,7 +3534,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG5E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG5E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3515,7 +3542,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG5E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG5E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3523,7 +3550,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG5E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG5E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3531,7 +3558,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG5E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG5E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3539,7 +3566,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG5E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG5E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3547,7 +3574,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG5E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG5E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3555,7 +3582,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG5E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG5E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3563,7 +3590,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG5E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG5E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3571,7 +3598,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG5E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG5E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3579,7 +3606,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG5E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG5E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3587,7 +3614,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG5E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG5E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3595,7 +3622,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG5EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG5EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3603,7 +3630,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG5EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG5EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3611,7 +3638,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG5EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG5EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3619,7 +3646,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG5EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG5EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3627,7 +3654,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG5EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG5EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3635,7 +3662,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG5EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG5EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3643,7 +3670,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG5EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG5EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3651,7 +3678,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG5EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG5EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3659,7 +3686,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG5EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG5EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3667,7 +3694,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG5EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG5EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3675,7 +3702,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG5EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG5EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3683,7 +3710,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG5EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG5EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3691,7 +3718,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG5EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG5EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3699,7 +3726,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG5EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG5EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3707,7 +3734,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG5EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG5EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3715,7 +3742,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG5EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG5EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3723,7 +3750,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG5E8FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG5E8FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -3731,7 +3758,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG5E16FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG5E16FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -3739,7 +3766,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG5E32FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG5E32FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -3747,7 +3774,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG5E64FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG5E64FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -3755,7 +3782,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG6E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG6E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3763,7 +3790,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG6E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG6E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3771,7 +3798,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG6E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG6E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3779,7 +3806,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG6E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG6E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3787,7 +3814,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG6E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG6E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3795,7 +3822,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG6E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG6E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3803,7 +3830,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG6E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG6E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3811,7 +3838,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG6E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG6E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -3819,7 +3846,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG6E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG6E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3827,7 +3854,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG6E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG6E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3835,7 +3862,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG6E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG6E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3843,7 +3870,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG6E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG6E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3851,7 +3878,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG6E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG6E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3859,7 +3886,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG6E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG6E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3867,7 +3894,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG6E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG6E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3875,7 +3902,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG6E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG6E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -3883,7 +3910,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG6EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG6EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3891,7 +3918,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG6EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG6EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3899,7 +3926,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG6EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG6EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3907,7 +3934,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG6EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG6EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3915,7 +3942,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG6EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG6EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3923,7 +3950,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG6EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG6EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3931,7 +3958,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG6EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG6EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3939,7 +3966,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG6EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG6EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3947,7 +3974,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG6EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG6EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3955,7 +3982,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG6EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG6EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3963,7 +3990,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG6EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG6EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3971,7 +3998,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG6EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG6EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3979,7 +4006,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG6EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG6EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3987,7 +4014,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG6EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG6EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -3995,7 +4022,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG6EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG6EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4003,7 +4030,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG6EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG6EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4011,7 +4038,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG6E8FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG6E8FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -4019,7 +4046,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG6E16FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG6E16FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -4027,7 +4054,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG6E32FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG6E32FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -4035,7 +4062,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG6E64FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG6E64FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -4043,7 +4070,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG7E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG7E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4051,7 +4078,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG7E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG7E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4059,7 +4086,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG7E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG7E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4067,7 +4094,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG7E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG7E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4075,7 +4102,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG7E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG7E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4083,7 +4110,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG7E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG7E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4091,7 +4118,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG7E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG7E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4099,7 +4126,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG7E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG7E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4107,7 +4134,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG7E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG7E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4115,7 +4142,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG7E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG7E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4123,7 +4150,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG7E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG7E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4131,7 +4158,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG7E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG7E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4139,7 +4166,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG7E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG7E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4147,7 +4174,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG7E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG7E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4155,7 +4182,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG7E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG7E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4163,7 +4190,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG7E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG7E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4171,7 +4198,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG7EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG7EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4179,7 +4206,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG7EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG7EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4187,7 +4214,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG7EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG7EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4195,7 +4222,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG7EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG7EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4203,7 +4230,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG7EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG7EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4211,7 +4238,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG7EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG7EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4219,7 +4246,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG7EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG7EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4227,7 +4254,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG7EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG7EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4235,7 +4262,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG7EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG7EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4243,7 +4270,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG7EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG7EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4251,7 +4278,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG7EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG7EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4259,7 +4286,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG7EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG7EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4267,7 +4294,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG7EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG7EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4275,7 +4302,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG7EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG7EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4283,7 +4310,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG7EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG7EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4291,7 +4318,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG7EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG7EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4299,7 +4326,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG7E8FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG7E8FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -4307,7 +4334,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG7E16FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG7E16FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -4315,7 +4342,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG7E32FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG7E32FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -4323,7 +4350,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG7E64FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG7E64FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -4331,7 +4358,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG8E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG8E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4339,7 +4366,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG8E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG8E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4347,7 +4374,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG8E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG8E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4355,7 +4382,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG8E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG8E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4363,7 +4390,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG8E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG8E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4371,7 +4398,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG8E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG8E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4379,7 +4406,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG8E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG8E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4387,7 +4414,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSEG8E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSEG8E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard);
 					v_ext.finishInstr(false);
 				}
@@ -4395,7 +4422,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG8E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG8E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4403,7 +4430,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG8E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG8E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4411,7 +4438,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG8E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG8E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4419,7 +4446,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSSEG8E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSSEG8E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4427,7 +4454,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG8E8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG8E8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4435,7 +4462,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG8E16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG8E16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4443,7 +4470,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG8E32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG8E32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4451,7 +4478,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSSSEG8E64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSSEG8E64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::standard_reg);
 					v_ext.finishInstr(false);
 				}
@@ -4459,7 +4486,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG8EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG8EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4467,7 +4494,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG8EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG8EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4475,7 +4502,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG8EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG8EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4483,7 +4510,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLUXSEG8EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLUXSEG8EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4491,7 +4518,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG8EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG8EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4499,7 +4526,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG8EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG8EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4507,7 +4534,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG8EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG8EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4515,7 +4542,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLOXSEG8EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLOXSEG8EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4523,7 +4550,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG8EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG8EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4531,7 +4558,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG8EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG8EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4539,7 +4566,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG8EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG8EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4547,7 +4574,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSUXSEG8EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUXSEG8EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4555,7 +4582,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG8EI8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG8EI8_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4563,7 +4590,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG8EI16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG8EI16_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 16, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4571,7 +4598,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG8EI32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG8EI32_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 32, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4579,7 +4606,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VSOXSEG8EI64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSOXSEG8EI64_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 64, VExt::load_store_type_t::indexed);
 					v_ext.finishInstr(false);
 				}
@@ -4587,7 +4614,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG8E8FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG8E8FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -4595,7 +4622,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG8E16FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG8E16FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -4603,7 +4630,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG8E32FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG8E32FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -4611,7 +4638,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VLSEG8E64FF_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VLSEG8E64FF_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::fofl);
 					v_ext.finishInstr(false);
 				}
@@ -4619,7 +4646,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL1RE8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL1RE8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4627,7 +4654,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL1RE16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL1RE16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4635,7 +4662,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL1RE32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL1RE32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4643,7 +4670,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL1RE64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL1RE64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4651,7 +4678,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VS1R_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VS1R_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4659,7 +4686,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL2RE8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL2RE8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4667,7 +4694,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL2RE16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL2RE16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4675,7 +4702,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL2RE32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL2RE32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4683,7 +4710,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL2RE64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL2RE64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4691,7 +4718,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VS2R_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VS2R_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4699,7 +4726,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL4RE8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL4RE8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4707,7 +4734,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL4RE16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL4RE16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4715,7 +4742,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL4RE32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL4RE32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4723,7 +4750,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL4RE64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL4RE64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4731,7 +4758,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VS4R_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VS4R_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4739,7 +4766,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL8RE8_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL8RE8_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 8, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4747,7 +4774,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL8RE16_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL8RE16_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 16, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4755,7 +4782,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL8RE32_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL8RE32_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 32, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4763,7 +4790,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VL8RE64_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VL8RE64_V);
 					v_ext.vLoadStore(VExt::load_store_t::load, 64, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
@@ -4771,490 +4798,490 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(VS8R_V) {
 					stats.inc_loadstore();
-					v_ext.prepInstr(true, false, false);
+					v_ext.prepInstr(true, false, false, Operation::OpId::VS8R_V);
 					v_ext.vLoadStore(VExt::load_store_t::store, 8, VExt::load_store_type_t::whole);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VADD_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VADD_VV);
 					v_ext.vLoop(v_ext.vAdd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VADD_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VADD_VI);
 					v_ext.vLoop(v_ext.vAdd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VADD_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VADD_VX);
 					v_ext.vLoop(v_ext.vAdd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSUB_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUB_VV);
 					v_ext.vLoop(v_ext.vSub(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSUB_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSUB_VX);
 					v_ext.vLoop(v_ext.vSub(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VRSUB_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VRSUB_VX);
 					v_ext.vLoop(v_ext.vRSub(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VRSUB_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VRSUB_VI);
 					v_ext.vLoop(v_ext.vRSub(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWADD_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWADD_VV);
 					v_ext.vLoop(v_ext.vAdd(), VExt::elem_sel_t::wxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWADD_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWADD_VX);
 					v_ext.vLoop(v_ext.vAdd(), VExt::elem_sel_t::wxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWSUB_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWSUB_VV);
 					v_ext.vLoop(v_ext.vSub(), VExt::elem_sel_t::wxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWSUB_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWSUB_VX);
 					v_ext.vLoop(v_ext.vSub(), VExt::elem_sel_t::wxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWADDU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWADDU_VV);
 					v_ext.vLoop(v_ext.vAdd(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWADDU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWADDU_VX);
 					v_ext.vLoop(v_ext.vAdd(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWSUBU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWSUBU_VV);
 					v_ext.vLoop(v_ext.vSub(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWSUBU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWSUBU_VX);
 					v_ext.vLoop(v_ext.vSub(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWADD_WV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWADD_WV);
 					v_ext.vLoop(v_ext.vAdd(), VExt::elem_sel_t::wwxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWADD_WX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWADD_WX);
 					v_ext.vLoop(v_ext.vAdd(), VExt::elem_sel_t::wwxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWSUB_WV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWSUB_WV);
 					v_ext.vLoop(v_ext.vSub(), VExt::elem_sel_t::wwxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWSUB_WX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWSUB_WX);
 					v_ext.vLoop(v_ext.vSub(), VExt::elem_sel_t::wwxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWADDU_WV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWADDU_WV);
 					v_ext.vLoop(v_ext.vAdd(), VExt::elem_sel_t::wwxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWADDU_WX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWADDU_WX);
 					v_ext.vLoop(v_ext.vAdd(), VExt::elem_sel_t::wwxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWSUBU_WV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWSUBU_WV);
 					v_ext.vLoop(v_ext.vSub(), VExt::elem_sel_t::wwxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWSUBU_WX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWSUBU_WX);
 					v_ext.vLoop(v_ext.vSub(), VExt::elem_sel_t::wwxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VZEXT_VF2) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VZEXT_VF2);
 					v_ext.vLoop(v_ext.vExt(2), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSEXT_VF2) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSEXT_VF2);
 					v_ext.vLoop(v_ext.vExt(2), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VZEXT_VF4) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VZEXT_VF4);
 					v_ext.vLoop(v_ext.vExt(4), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSEXT_VF4) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSEXT_VF4);
 					v_ext.vLoop(v_ext.vExt(4), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VZEXT_VF8) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VZEXT_VF8);
 					v_ext.vLoop(v_ext.vExt(8), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSEXT_VF8) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSEXT_VF8);
 					v_ext.vLoop(v_ext.vExt(8), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VADC_VVM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VADC_VVM);
 					v_ext.vLoopExtCarry(v_ext.vAdc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VADC_VXM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VADC_VXM);
 					v_ext.vLoopExtCarry(v_ext.vAdc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VADC_VIM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VADC_VIM);
 					v_ext.vLoopExtCarry(v_ext.vAdc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMADC_VVM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMADC_VVM);
 					v_ext.vLoopVoidAll(v_ext.vMadc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMADC_VXM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMADC_VXM);
 					v_ext.vLoopVoidAll(v_ext.vMadc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMADC_VIM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMADC_VIM);
 					v_ext.vLoopVoidAll(v_ext.vMadc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMADC_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMADC_VV);
 					v_ext.vLoopVoidAll(v_ext.vMadc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMADC_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMADC_VX);
 					v_ext.vLoopVoidAll(v_ext.vMadc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMADC_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMADC_VI);
 					v_ext.vLoopVoidAll(v_ext.vMadc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSBC_VVM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSBC_VVM);
 					v_ext.vLoopExtCarry(v_ext.vSbc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSBC_VXM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSBC_VXM);
 					v_ext.vLoopExtCarry(v_ext.vSbc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMSBC_VVM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSBC_VVM);
 					v_ext.vLoopVoidAll(v_ext.vMsbc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMSBC_VXM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSBC_VXM);
 					v_ext.vLoopVoidAll(v_ext.vMsbc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMSBC_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSBC_VV);
 					v_ext.vLoopVoidAll(v_ext.vMsbc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMSBC_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSBC_VX);
 					v_ext.vLoopVoidAll(v_ext.vMsbc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VAND_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VAND_VI);
 					v_ext.vLoop(v_ext.vAnd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VAND_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VAND_VV);
 					v_ext.vLoop(v_ext.vAnd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VAND_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VAND_VX);
 					v_ext.vLoop(v_ext.vAnd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VOR_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VOR_VV);
 					v_ext.vLoop(v_ext.vOr(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VOR_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VOR_VI);
 					v_ext.vLoop(v_ext.vOr(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VOR_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VOR_VX);
 					v_ext.vLoop(v_ext.vOr(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VXOR_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VXOR_VV);
 					v_ext.vLoop(v_ext.vXor(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VXOR_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VXOR_VI);
 					v_ext.vLoop(v_ext.vXor(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VXOR_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VXOR_VX);
 					v_ext.vLoop(v_ext.vXor(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSLL_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSLL_VI);
 					v_ext.vLoop(v_ext.vShift(false), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSLL_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSLL_VV);
 					v_ext.vLoop(v_ext.vShift(false), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSLL_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSLL_VX);
 					v_ext.vLoop(v_ext.vShift(false), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSRL_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSRL_VV);
 					v_ext.vLoop(v_ext.vShift(true), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSRL_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSRL_VI);
 					v_ext.vLoop(v_ext.vShift(true), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSRL_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSRL_VX);
 					v_ext.vLoop(v_ext.vShift(true), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSRA_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSRA_VV);
 					v_ext.vLoop(v_ext.vShift(true), VExt::elem_sel_t::xxxssu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSRA_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSRA_VI);
 					v_ext.vLoop(v_ext.vShift(true), VExt::elem_sel_t::xxxssu, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSRA_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSRA_VX);
 					v_ext.vLoop(v_ext.vShift(true), VExt::elem_sel_t::xxxssu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNSRL_WV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNSRL_WV);
 					v_ext.vLoop(v_ext.vShift(true), VExt::elem_sel_t::xwxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNSRL_WI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNSRL_WI);
 					v_ext.vLoop(v_ext.vShift(true), VExt::elem_sel_t::xwxuuu, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNSRL_WX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNSRL_WX);
 					v_ext.vLoop(v_ext.vShift(true), VExt::elem_sel_t::xwxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNSRA_WV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNSRA_WV);
 					v_ext.vLoop(v_ext.vShift(true), VExt::elem_sel_t::xwxssu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNSRA_WI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNSRA_WI);
 					v_ext.vLoop(v_ext.vShift(true), VExt::elem_sel_t::xwxssu, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNSRA_WX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNSRA_WX);
 					v_ext.vLoop(v_ext.vShift(true), VExt::elem_sel_t::xwxssu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMSEQ_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSEQ_VV);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::eq), VExt::elem_sel_t::xxxsss,
 					                     VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
@@ -5262,7 +5289,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSEQ_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSEQ_VX);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::eq), VExt::elem_sel_t::xxxsss,
 					                     VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
@@ -5270,7 +5297,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSEQ_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSEQ_VI);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::eq), VExt::elem_sel_t::xxxsss,
 					                     VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
@@ -5278,7 +5305,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSNE_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSNE_VV);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::ne), VExt::elem_sel_t::xxxsss,
 					                     VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
@@ -5286,7 +5313,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSNE_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSNE_VX);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::ne), VExt::elem_sel_t::xxxsss,
 					                     VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
@@ -5294,7 +5321,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSNE_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSNE_VI);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::ne), VExt::elem_sel_t::xxxsss,
 					                     VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
@@ -5302,7 +5329,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSLTU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSLTU_VV);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::lt), VExt::elem_sel_t::xxxuuu,
 					                     VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
@@ -5310,7 +5337,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSLTU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSLTU_VX);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::lt), VExt::elem_sel_t::xxxuuu,
 					                     VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
@@ -5318,7 +5345,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSLT_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSLT_VV);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::lt), VExt::elem_sel_t::xxxsss,
 					                     VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
@@ -5326,7 +5353,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSLT_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSLT_VX);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::lt), VExt::elem_sel_t::xxxsss,
 					                     VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
@@ -5334,7 +5361,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSLEU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSLEU_VV);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::le), VExt::elem_sel_t::xxxuuu,
 					                     VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
@@ -5342,7 +5369,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSLEU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSLEU_VX);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::le), VExt::elem_sel_t::xxxuuu,
 					                     VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
@@ -5350,7 +5377,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSLEU_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSLEU_VI);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::le), VExt::elem_sel_t::xxxuus,
 					                     VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
@@ -5358,7 +5385,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSLE_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSLE_VV);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::le), VExt::elem_sel_t::xxxsss,
 					                     VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
@@ -5366,7 +5393,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSLE_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSLE_VX);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::le), VExt::elem_sel_t::xxxsss,
 					                     VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
@@ -5374,7 +5401,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSLE_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSLE_VI);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::le), VExt::elem_sel_t::xxxsss,
 					                     VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
@@ -5382,7 +5409,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSGTU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSGTU_VX);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::gt), VExt::elem_sel_t::xxxuuu,
 					                     VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
@@ -5390,7 +5417,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSGTU_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSGTU_VI);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::gt), VExt::elem_sel_t::xxxuus,
 					                     VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
@@ -5398,7 +5425,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSGT_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSGT_VX);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::gt), VExt::elem_sel_t::xxxsss,
 					                     VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
@@ -5406,7 +5433,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMSGT_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSGT_VI);
 					v_ext.vLoopVdExtVoid(v_ext.vCompInt(VExt::int_compare_t::gt), VExt::elem_sel_t::xxxsss,
 					                     VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
@@ -5414,1561 +5441,1561 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMINU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMINU_VV);
 					v_ext.vLoop(v_ext.vMin(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMINU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMINU_VX);
 					v_ext.vLoop(v_ext.vMin(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMIN_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMIN_VV);
 					v_ext.vLoop(v_ext.vMin(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMIN_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMIN_VX);
 					v_ext.vLoop(v_ext.vMin(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMAXU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMAXU_VV);
 					v_ext.vLoop(v_ext.vMax(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMAXU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMAXU_VX);
 					v_ext.vLoop(v_ext.vMax(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMAX_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMAX_VV);
 					v_ext.vLoop(v_ext.vMax(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMAX_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMAX_VX);
 					v_ext.vLoop(v_ext.vMax(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMUL_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMUL_VV);
 					v_ext.vLoop(v_ext.vMul(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMUL_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMUL_VX);
 					v_ext.vLoop(v_ext.vMul(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMULH_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMULH_VV);
 					v_ext.vLoop(v_ext.vMulh(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMULH_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMULH_VX);
 					v_ext.vLoop(v_ext.vMulh(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMULHU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMULHU_VV);
 					v_ext.vLoop(v_ext.vMulh(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMULHU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMULHU_VX);
 					v_ext.vLoop(v_ext.vMulh(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMULHSU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMULHSU_VV);
 					v_ext.vLoop(v_ext.vMulh(), VExt::elem_sel_t::xxxssu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMULHSU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMULHSU_VX);
 					v_ext.vLoop(v_ext.vMulh(), VExt::elem_sel_t::xxxssu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VDIVU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VDIVU_VV);
 					v_ext.vLoop(v_ext.vDiv(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VDIVU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VDIVU_VX);
 					v_ext.vLoop(v_ext.vDiv(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VDIV_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VDIV_VV);
 					v_ext.vLoop(v_ext.vDiv(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VDIV_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VDIV_VX);
 					v_ext.vLoop(v_ext.vDiv(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VREMU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VREMU_VV);
 					v_ext.vLoop(v_ext.vRem(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VREMU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VREMU_VX);
 					v_ext.vLoop(v_ext.vRem(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VREM_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VREM_VV);
 					v_ext.vLoop(v_ext.vRem(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VREM_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VREM_VX);
 					v_ext.vLoop(v_ext.vRem(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWMUL_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWMUL_VV);
 					v_ext.vLoop(v_ext.vMul(), VExt::elem_sel_t::wxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWMUL_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWMUL_VX);
 					v_ext.vLoop(v_ext.vMul(), VExt::elem_sel_t::wxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWMULU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWMULU_VV);
 					v_ext.vLoop(v_ext.vMul(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWMULU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWMULU_VX);
 					v_ext.vLoop(v_ext.vMul(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWMULSU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWMULSU_VV);
 					v_ext.vLoop(v_ext.vMul(), VExt::elem_sel_t::wxxusu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWMULSU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWMULSU_VX);
 					v_ext.vLoop(v_ext.vMul(), VExt::elem_sel_t::wxxusu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMACC_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMACC_VV);
 					v_ext.vLoopVdExt(v_ext.vMacc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMACC_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMACC_VX);
 					v_ext.vLoopVdExt(v_ext.vMacc(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNMSAC_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNMSAC_VV);
 					v_ext.vLoopVdExt(v_ext.vNmsac(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNMSAC_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNMSAC_VX);
 					v_ext.vLoopVdExt(v_ext.vNmsac(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMADD_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMADD_VV);
 					v_ext.vLoopVdExt(v_ext.vMadd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMADD_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMADD_VX);
 					v_ext.vLoopVdExt(v_ext.vMadd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNMSUB_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNMSUB_VV);
 					v_ext.vLoopVdExt(v_ext.vNmsub(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNMSUB_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNMSUB_VX);
 					v_ext.vLoopVdExt(v_ext.vNmsub(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWMACCU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWMACCU_VV);
 					v_ext.vLoopVdExt(v_ext.vMacc(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWMACCU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWMACCU_VX);
 					v_ext.vLoopVdExt(v_ext.vMacc(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWMACC_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWMACC_VV);
 					v_ext.vLoopVdExt(v_ext.vMacc(), VExt::elem_sel_t::wxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWMACC_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWMACC_VX);
 					v_ext.vLoopVdExt(v_ext.vMacc(), VExt::elem_sel_t::wxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWMACCSU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWMACCSU_VV);
 					v_ext.vLoopVdExt(v_ext.vMacc(), VExt::elem_sel_t::wxxuus, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWMACCSU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWMACCSU_VX);
 					v_ext.vLoopVdExt(v_ext.vMacc(), VExt::elem_sel_t::wxxuus, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWMACCUS_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWMACCUS_VX);
 					v_ext.vLoopVdExt(v_ext.vMacc(), VExt::elem_sel_t::wxxusu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMERGE_VVM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMERGE_VVM);
 					v_ext.vLoopExtCarry(v_ext.vMerge(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMERGE_VXM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMERGE_VXM);
 					v_ext.vLoopExtCarry(v_ext.vMerge(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMERGE_VIM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMERGE_VIM);
 					v_ext.vLoopExtCarry(v_ext.vMerge(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMV_V_V) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMV_V_V);
 					v_ext.vLoop(v_ext.vMv(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMV_V_X) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMV_V_X);
 					v_ext.vLoop(v_ext.vMv(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMV_V_I) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMV_V_I);
 					v_ext.vLoop(v_ext.vMv(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSADDU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSADDU_VV);
 					v_ext.vLoop(v_ext.vSaddu(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSADDU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSADDU_VX);
 					v_ext.vLoop(v_ext.vSaddu(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSADDU_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSADDU_VI);
 					v_ext.vLoop(v_ext.vSaddu(), VExt::elem_sel_t::xxxuus, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSADD_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSADD_VV);
 					v_ext.vLoop(v_ext.vSadd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSADD_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSADD_VX);
 					v_ext.vLoop(v_ext.vSadd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSADD_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSADD_VI);
 					v_ext.vLoop(v_ext.vSadd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSSUBU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSUBU_VV);
 					v_ext.vLoop(v_ext.vSsubu(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSSUBU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSUBU_VX);
 					v_ext.vLoop(v_ext.vSsubu(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSSUB_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSUB_VV);
 					v_ext.vLoop(v_ext.vSsub(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSSUB_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSUB_VX);
 					v_ext.vLoop(v_ext.vSsub(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VAADDU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VAADDU_VV);
 					v_ext.vLoop(v_ext.vAadd(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VAADDU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VAADDU_VX);
 					v_ext.vLoop(v_ext.vAadd(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VAADD_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VAADD_VV);
 					v_ext.vLoop(v_ext.vAadd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VAADD_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VAADD_VX);
 					v_ext.vLoop(v_ext.vAadd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VASUBU_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VASUBU_VV);
 					v_ext.vLoop(v_ext.vAsub(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VASUBU_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VASUBU_VX);
 					v_ext.vLoop(v_ext.vAsub(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VASUB_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VASUB_VV);
 					v_ext.vLoop(v_ext.vAsub(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VASUB_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VASUB_VX);
 					v_ext.vLoop(v_ext.vAsub(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSMUL_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSMUL_VV);
 					v_ext.vLoop(v_ext.vSmul(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSMUL_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSMUL_VX);
 					v_ext.vLoop(v_ext.vSmul(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSSRL_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSRL_VV);
 					v_ext.vLoop(v_ext.vShiftRight(false), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSSRL_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSRL_VX);
 					v_ext.vLoop(v_ext.vShiftRight(false), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSSRL_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSRL_VI);
 					v_ext.vLoop(v_ext.vShiftRight(false), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSSRA_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSRA_VV);
 					v_ext.vLoop(v_ext.vShiftRight(false), VExt::elem_sel_t::xxxssu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSSRA_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSRA_VX);
 					v_ext.vLoop(v_ext.vShiftRight(false), VExt::elem_sel_t::xxxssu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSSRA_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSSRA_VI);
 					v_ext.vLoop(v_ext.vShiftRight(false), VExt::elem_sel_t::xxxssu, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNCLIPU_WV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNCLIPU_WV);
 					v_ext.vLoop(v_ext.vShiftRight(true), VExt::elem_sel_t::xwxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNCLIPU_WX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNCLIPU_WX);
 					v_ext.vLoop(v_ext.vShiftRight(true), VExt::elem_sel_t::xwxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNCLIPU_WI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNCLIPU_WI);
 					v_ext.vLoop(v_ext.vShiftRight(true), VExt::elem_sel_t::xwxuuu, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNCLIP_WV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNCLIP_WV);
 					v_ext.vLoop(v_ext.vShiftRight(true), VExt::elem_sel_t::xwxssu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNCLIP_WX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNCLIP_WX);
 					v_ext.vLoop(v_ext.vShiftRight(true), VExt::elem_sel_t::xwxssu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VNCLIP_WI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VNCLIP_WI);
 					v_ext.vLoop(v_ext.vShiftRight(true), VExt::elem_sel_t::xwxssu, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VFADD_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFADD_VV);
 					v_ext.vLoopVdExt(v_ext.vfAdd(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFADD_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFADD_VF);
 					v_ext.vLoopVdExt(v_ext.vfAdd(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFSUB_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFSUB_VV);
 					v_ext.vLoopVdExt(v_ext.vfSub(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFSUB_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFSUB_VF);
 					v_ext.vLoopVdExt(v_ext.vfSub(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFRSUB_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFRSUB_VF);
 					v_ext.vLoopVdExt(v_ext.vfrSub(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWADD_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWADD_VV);
 					v_ext.vLoopVdExt(v_ext.vfwAdd(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWADD_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWADD_VF);
 					v_ext.vLoopVdExt(v_ext.vfwAdd(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWSUB_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWSUB_VV);
 					v_ext.vLoopVdExt(v_ext.vfwSub(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWSUB_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWSUB_VF);
 					v_ext.vLoopVdExt(v_ext.vfwSub(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWADD_WV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWADD_WV);
 					v_ext.vLoopVdExt(v_ext.vfwAddw(), VExt::elem_sel_t::wwxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWADD_WF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWADD_WF);
 					v_ext.vLoopVdExt(v_ext.vfwAddw(), VExt::elem_sel_t::wwxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWSUB_WV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWSUB_WV);
 					v_ext.vLoopVdExt(v_ext.vfwSubw(), VExt::elem_sel_t::wwxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWSUB_WF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWSUB_WF);
 					v_ext.vLoopVdExt(v_ext.vfwSubw(), VExt::elem_sel_t::wwxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMUL_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMUL_VV);
 					v_ext.vLoopVdExt(v_ext.vfMul(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMUL_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMUL_VF);
 					v_ext.vLoopVdExt(v_ext.vfMul(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFDIV_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFDIV_VV);
 					v_ext.vLoopVdExt(v_ext.vfDiv(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFDIV_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFDIV_VF);
 					v_ext.vLoopVdExt(v_ext.vfDiv(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFRDIV_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFRDIV_VF);
 					v_ext.vLoopVdExt(v_ext.vfrDiv(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWMUL_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWMUL_VV);
 					v_ext.vLoopVdExt(v_ext.vfwMul(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWMUL_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWMUL_VF);
 					v_ext.vLoopVdExt(v_ext.vfwMul(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMACC_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMACC_VV);
 					v_ext.vLoopVdExt(v_ext.vfMacc(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMACC_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMACC_VF);
 					v_ext.vLoopVdExt(v_ext.vfMacc(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNMACC_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNMACC_VV);
 					v_ext.vLoopVdExt(v_ext.vfNmacc(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNMACC_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNMACC_VF);
 					v_ext.vLoopVdExt(v_ext.vfNmacc(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMSAC_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMSAC_VV);
 					v_ext.vLoopVdExt(v_ext.vfMsac(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMSAC_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMSAC_VF);
 					v_ext.vLoopVdExt(v_ext.vfMsac(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNMSAC_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNMSAC_VV);
 					v_ext.vLoopVdExt(v_ext.vfNmsac(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNMSAC_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNMSAC_VF);
 					v_ext.vLoopVdExt(v_ext.vfNmsac(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMADD_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMADD_VV);
 					v_ext.vLoopVdExt(v_ext.vfMadd(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMADD_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMADD_VF);
 					v_ext.vLoopVdExt(v_ext.vfMadd(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNMADD_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNMADD_VV);
 					v_ext.vLoopVdExt(v_ext.vfNmadd(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNMADD_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNMADD_VF);
 					v_ext.vLoopVdExt(v_ext.vfNmadd(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMSUB_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMSUB_VV);
 					v_ext.vLoopVdExt(v_ext.vfMsub(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMSUB_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMSUB_VF);
 					v_ext.vLoopVdExt(v_ext.vfMsub(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNMSUB_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNMSUB_VV);
 					v_ext.vLoopVdExt(v_ext.vfNmsub(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNMSUB_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNMSUB_VF);
 					v_ext.vLoopVdExt(v_ext.vfNmsub(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWMACC_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWMACC_VV);
 					v_ext.vLoopVdExt(v_ext.vfwMacc(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWMACC_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWMACC_VF);
 					v_ext.vLoopVdExt(v_ext.vfwMacc(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWNMACC_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWNMACC_VV);
 					v_ext.vLoopVdExt(v_ext.vfwNmacc(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWNMACC_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWNMACC_VF);
 					v_ext.vLoopVdExt(v_ext.vfwNmacc(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWMSAC_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWMSAC_VV);
 					v_ext.vLoopVdExt(v_ext.vfwMsac(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWMSAC_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWMSAC_VF);
 					v_ext.vLoopVdExt(v_ext.vfwMsac(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWNMSAC_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWNMSAC_VV);
 					v_ext.vLoopVdExt(v_ext.vfwNmsac(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWNMSAC_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWNMSAC_VF);
 					v_ext.vLoopVdExt(v_ext.vfwNmsac(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFSQRT_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFSQRT_V);
 					v_ext.vLoopVdExt(v_ext.vfSqrt(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFRSQRT7_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFRSQRT7_V);
 					v_ext.vLoopVdExt(v_ext.vfRsqrt7(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFREC7_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFREC7_V);
 					v_ext.vLoopVdExt(v_ext.vfFrec7(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMIN_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMIN_VV);
 					v_ext.vLoopVdExt(v_ext.vfMin(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMIN_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMIN_VF);
 					v_ext.vLoopVdExt(v_ext.vfMin(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMAX_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMAX_VV);
 					v_ext.vLoopVdExt(v_ext.vfMax(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMAX_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMAX_VF);
 					v_ext.vLoopVdExt(v_ext.vfMax(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFSGNJ_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFSGNJ_VV);
 					v_ext.vLoopVdExt(v_ext.vfSgnj(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFSGNJ_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFSGNJ_VF);
 					v_ext.vLoopVdExt(v_ext.vfSgnj(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFSGNJN_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFSGNJN_VV);
 					v_ext.vLoopVdExt(v_ext.vfSgnjn(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFSGNJN_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFSGNJN_VF);
 					v_ext.vLoopVdExt(v_ext.vfSgnjn(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFSGNJX_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFSGNJX_VV);
 					v_ext.vLoopVdExt(v_ext.vfSgnjx(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFSGNJX_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFSGNJX_VF);
 					v_ext.vLoopVdExt(v_ext.vfSgnjx(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VMFEQ_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VMFEQ_VV);
 					v_ext.vLoopVdExtVoid(v_ext.vMfeq(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VMFEQ_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VMFEQ_VF);
 					v_ext.vLoopVdExtVoid(v_ext.vMfeq(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VMFNE_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VMFNE_VV);
 					v_ext.vLoopVdExtVoid(v_ext.vMfneq(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VMFNE_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VMFNE_VF);
 					v_ext.vLoopVdExtVoid(v_ext.vMfneq(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VMFLT_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VMFLT_VV);
 					v_ext.vLoopVdExtVoid(v_ext.vMflt(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VMFLT_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VMFLT_VF);
 					v_ext.vLoopVdExtVoid(v_ext.vMflt(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VMFLE_VV) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VMFLE_VV);
 					v_ext.vLoopVdExtVoid(v_ext.vMfle(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VMFLE_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VMFLE_VF);
 					v_ext.vLoopVdExtVoid(v_ext.vMfle(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VMFGT_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VMFGT_VF);
 					v_ext.vLoopVdExtVoid(v_ext.vMfgt(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VMFGE_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VMFGE_VF);
 					v_ext.vLoopVdExtVoid(v_ext.vMfge(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFCLASS_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFCLASS_V);
 					v_ext.vLoopVdExt(v_ext.vfClass(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMERGE_VFM) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMERGE_VFM);
 					v_ext.vLoopExtCarry(v_ext.vMerge(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMV_V_F) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMV_V_F);
 					v_ext.vLoop(v_ext.vfMv(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFCVT_XU_F_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFCVT_XU_F_V);
 					v_ext.vLoopVdExt(v_ext.vfCvtXF(false), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFCVT_X_F_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFCVT_X_F_V);
 					v_ext.vLoopVdExt(v_ext.vfCvtXF(false), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFCVT_RTZ_XU_F_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFCVT_RTZ_XU_F_V);
 					v_ext.vLoopVdExt(v_ext.vfCvtXF(true), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFCVT_RTZ_X_F_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFCVT_RTZ_X_F_V);
 					v_ext.vLoopVdExt(v_ext.vfCvtXF(true), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFCVT_F_XU_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFCVT_F_XU_V);
 					v_ext.vLoop(v_ext.vfCvtFX(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFCVT_F_X_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFCVT_F_X_V);
 					v_ext.vLoop(v_ext.vfCvtFX(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWCVT_XU_F_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWCVT_XU_F_V);
 					v_ext.vLoopVdExt(v_ext.vfCvtwXF(false), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWCVT_X_F_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWCVT_X_F_V);
 					v_ext.vLoopVdExt(v_ext.vfCvtwXF(false), VExt::elem_sel_t::wxxsss, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWCVT_RTZ_XU_F_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWCVT_RTZ_XU_F_V);
 					v_ext.vLoopVdExt(v_ext.vfCvtwXF(true), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWCVT_RTZ_X_F_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWCVT_RTZ_X_F_V);
 					v_ext.vLoopVdExt(v_ext.vfCvtwXF(true), VExt::elem_sel_t::wxxsss, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWCVT_F_XU_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWCVT_F_XU_V);
 					v_ext.vLoop(v_ext.vfCvtFX(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWCVT_F_X_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWCVT_F_X_V);
 					v_ext.vLoop(v_ext.vfCvtFX(), VExt::elem_sel_t::wxxsss, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWCVT_F_F_V) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWCVT_F_F_V);
 					v_ext.vLoopVdExt(v_ext.vfCvtwFF(), VExt::elem_sel_t::wxxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNCVT_XU_F_W) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNCVT_XU_F_W);
 					v_ext.vLoopVdExt(v_ext.vfCvtnXF(false), VExt::elem_sel_t::xwxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNCVT_X_F_W) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNCVT_X_F_W);
 					v_ext.vLoopVdExt(v_ext.vfCvtnXF(false), VExt::elem_sel_t::xwxsss, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNCVT_RTZ_XU_F_W) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNCVT_RTZ_XU_F_W);
 					v_ext.vLoopVdExt(v_ext.vfCvtnXF(true), VExt::elem_sel_t::xwxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNCVT_RTZ_X_F_W) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNCVT_RTZ_X_F_W);
 					v_ext.vLoopVdExt(v_ext.vfCvtnXF(true), VExt::elem_sel_t::xwxsss, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNCVT_F_XU_W) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNCVT_F_XU_W);
 					v_ext.vLoop(v_ext.vfCvtFX(), VExt::elem_sel_t::xwxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNCVT_F_X_W) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNCVT_F_X_W);
 					v_ext.vLoop(v_ext.vfCvtFX(), VExt::elem_sel_t::xwxsss, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNCVT_F_F_W) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNCVT_F_F_W);
 					v_ext.vLoopVdExt(v_ext.vfCvtnFF(false), VExt::elem_sel_t::xwxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFNCVT_ROD_F_F_W) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFNCVT_ROD_F_F_W);
 					v_ext.vLoopVdExt(v_ext.vfCvtnFF(true), VExt::elem_sel_t::xwxuuu, VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VREDSUM_VS) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VREDSUM_VS);
 					v_ext.vLoopRed(v_ext.vRedSum(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VREDMAXU_VS) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VREDMAXU_VS);
 					v_ext.vLoopRed(v_ext.vRedMax(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VREDMAX_VS) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VREDMAX_VS);
 					v_ext.vLoopRed(v_ext.vRedMax(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VREDMINU_VS) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VREDMINU_VS);
 					v_ext.vLoopRed(v_ext.vRedMin(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VREDMIN_VS) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VREDMIN_VS);
 					v_ext.vLoopRed(v_ext.vRedMin(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VREDAND_VS) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VREDAND_VS);
 					v_ext.vLoopRed(v_ext.vRedAnd(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VREDOR_VS) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VREDOR_VS);
 					v_ext.vLoopRed(v_ext.vRedOr(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VREDXOR_VS) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VREDXOR_VS);
 					v_ext.vLoopRed(v_ext.vRedXor(), VExt::elem_sel_t::xxxsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWREDSUMU_VS) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWREDSUMU_VS);
 					v_ext.vLoopRed(v_ext.vRedSum(), VExt::elem_sel_t::wxwuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VWREDSUM_VS) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VWREDSUM_VS);
 					v_ext.vLoopRed(v_ext.vRedSum(), VExt::elem_sel_t::wxwsss, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VFREDUSUM_VS) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFREDUSUM_VS);
 					v_ext.vLoopRed(v_ext.vfRedSum(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFREDOSUM_VS) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFREDOSUM_VS);
 					v_ext.vLoopRed(v_ext.vfRedSum(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFREDMAX_VS) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFREDMAX_VS);
 					v_ext.vLoopRed(v_ext.vfRedMax(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFREDMIN_VS) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFREDMIN_VS);
 					v_ext.vLoopRed(v_ext.vfRedMin(), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWREDUSUM_VS) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWREDUSUM_VS);
 					v_ext.vLoopRed(v_ext.vfwRedSum(), VExt::elem_sel_t::wxwuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFWREDOSUM_VS) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFWREDOSUM_VS);
 					v_ext.vLoopRed(v_ext.vfwRedSum(), VExt::elem_sel_t::wxwuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VMAND_MM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMAND_MM);
 					v_ext.vLoopVoidAllMask(v_ext.vMask(VExt::maskOperation::m_and));
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMNAND_MM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMNAND_MM);
 					v_ext.vLoopVoidAllMask(v_ext.vMask(VExt::maskOperation::m_nand));
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMANDN_MM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMANDN_MM);
 					v_ext.vLoopVoidAllMask(v_ext.vMask(VExt::maskOperation::m_andn));
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMXOR_MM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMXOR_MM);
 					v_ext.vLoopVoidAllMask(v_ext.vMask(VExt::maskOperation::m_xor));
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMOR_MM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMOR_MM);
 					v_ext.vLoopVoidAllMask(v_ext.vMask(VExt::maskOperation::m_or));
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMNOR_MM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMNOR_MM);
 					v_ext.vLoopVoidAllMask(v_ext.vMask(VExt::maskOperation::m_nor));
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMORN_MM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMORN_MM);
 					v_ext.vLoopVoidAllMask(v_ext.vMask(VExt::maskOperation::m_orn));
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMXNOR_MM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMXNOR_MM);
 					v_ext.vLoopVoidAllMask(v_ext.vMask(VExt::maskOperation::m_xnor));
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VCPOP_M) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VCPOP_M);
 					v_ext.vCpop();
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VFIRST_M) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VFIRST_M);
 					v_ext.vFirst();
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMSBF_M) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSBF_M);
 					v_ext.vMs(VExt::vms_type_t::sbf);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMSIF_M) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSIF_M);
 					v_ext.vMs(VExt::vms_type_t::sif);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMSOF_M) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMSOF_M);
 					v_ext.vMs(VExt::vms_type_t::sof);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VIOTA_M) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VIOTA_M);
 					v_ext.vIota();
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VID_V) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VID_V);
 					v_ext.vLoopVoid(v_ext.vId(), VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMV_X_S) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMV_X_S);
 					v_ext.vMvXs();
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMV_S_X) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMV_S_X);
 					v_ext.vMvSx();
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VFMV_F_S) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMV_F_S);
 					v_ext.vMvFs();
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VFMV_S_F) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFMV_S_F);
 					v_ext.vMvSf();
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VSLIDEUP_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSLIDEUP_VX);
 					v_ext.vLoopVoidNoOverlap(v_ext.vSlideUp(regs[instr.rs1()]), VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSLIDEUP_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSLIDEUP_VI);
 					v_ext.vLoopVoidNoOverlap(v_ext.vSlideUp(instr.rs1()), VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSLIDEDOWN_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSLIDEDOWN_VX);
 					v_ext.vLoopVoid(v_ext.vSlideDown(regs[instr.rs1()]), VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSLIDEDOWN_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSLIDEDOWN_VI);
 					v_ext.vLoopVoid(v_ext.vSlideDown(instr.rs1()), VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VSLIDE1UP_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSLIDE1UP_VX);
 					v_ext.vLoopVoidNoOverlap(v_ext.vSlide1Up(VExt::param_sel_t::vx), VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VFSLIDE1UP_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFSLIDE1UP_VF);
 					v_ext.vLoopVoidNoOverlap(v_ext.vSlide1Up(VExt::param_sel_t::vf), VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VSLIDE1DOWN_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VSLIDE1DOWN_VX);
 					v_ext.vLoopVoid(v_ext.vSlide1Down(VExt::param_sel_t::vx), VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VFSLIDE1DOWN_VF) {
-					v_ext.prepInstr(true, true, true);
+					v_ext.prepInstr(true, true, true, Operation::OpId::VFSLIDE1DOWN_VF);
 					v_ext.vLoopVoid(v_ext.vSlide1Down(VExt::param_sel_t::vf), VExt::param_sel_t::vf);
 					v_ext.finishInstr(true);
 				}
 				OP_END();
 
 				OP_CASE(VRGATHER_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VRGATHER_VV);
 					v_ext.vLoopExt(v_ext.vGather(false), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VRGATHEREI16_VV) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VRGATHEREI16_VV);
 					v_ext.vLoopExt(v_ext.vGather(true), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vv);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VRGATHER_VX) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VRGATHER_VX);
 					v_ext.vLoopExt(v_ext.vGather(false), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vx);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VRGATHER_VI) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VRGATHER_VI);
 					v_ext.vLoopExt(v_ext.vGather(false), VExt::elem_sel_t::xxxuuu, VExt::param_sel_t::vi);
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VCOMPRESS_VM) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VCOMPRESS_VM);
 					v_ext.vCompress();
 					v_ext.finishInstr(false);
 				}
 				OP_END();
 
 				OP_CASE(VMV_NR_R_V) {
-					v_ext.prepInstr(true, true, false);
+					v_ext.prepInstr(true, true, false, Operation::OpId::VMV_NR_R_V);
 					v_ext.vMvNr();
 					v_ext.finishInstr(false);
 				}

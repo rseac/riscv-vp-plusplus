@@ -50,6 +50,13 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	void exec_steps(const bool debug_single_step);
 
    public:
+    void inject_cycles(uint64_t n) {
+        dbbcache.inject_cycles(n * prop_clock_cycle_period.value());
+    }
+    uint64_t get_cycle_count() {
+        return dbbcache.get_cycle_counter_raw() / prop_clock_cycle_period.value();
+    }
+
 #ifdef ISS_CT_STATS_ENABLED
 	ISSStats stats;
 #else

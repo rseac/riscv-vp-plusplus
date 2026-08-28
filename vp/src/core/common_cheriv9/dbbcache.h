@@ -312,7 +312,8 @@ class DBBCacheDummy_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if
 		return pc;
 	}
 
-	__always_inline uint64_t get_cycle_counter_raw() {
+	__always_inline void inject_cycles(uint64_t n) { cycle_counter_raw += n; }
+	uint64_t get_cycle_counter_raw() {
 		return cycle_counter_raw;
 	}
 
