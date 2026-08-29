@@ -27,9 +27,10 @@ template <typename iss_type>
 class VExtension {
    private:
     uint64_t vreg_ready_cycle_[32] = {0};
+    uint64_t vector_busy_until_cycle_ = 0;
     bool timing_enabled_ = false;
     AraTimingModel* timing_model_ = nullptr;
-    Operation::OpId current_opId_;
+    Operation::OpId current_opId_ = Operation::OpId::UNDEF;
     bool has_current_opId_ = false;
 
     std::vector<uint32_t> get_accessed_vregs() const {
@@ -56,32 +57,57 @@ class VExtension {
             }
         };
 
-        bool is_vector_insn = false;
         if (opcode == 0x57 && funct3 != 7) {
-            is_vector_insn = true;
-            add_reg_group(rd, n_regs);
             add_reg_group(rs2, n_regs);
             if (funct3 == 0 || funct3 == 1 || funct3 == 2) {
                 add_reg_group(rs1, n_regs);
             }
+            add_reg_group(rd, n_regs);
         } else if (opcode == 0x07) {
-            is_vector_insn = true;
             add_reg_group(rd, n_regs);
             if (mop == 1 || mop == 3) {
                 add_reg_group(rs2, n_regs);
             }
         } else if (opcode == 0x27) {
-            is_vector_insn = true;
             add_reg_group(rd, n_regs);
             if (mop == 1 || mop == 3) {
                 add_reg_group(rs2, n_regs);
             }
         }
         
-        if (is_vector_insn && vm == 0) {
+        if (vm == 0) {
             regs.push_back(0);
         }
         
+        return regs;
+    }
+
+    std::vector<uint32_t> get_dest_vregs() const {
+        std::vector<uint32_t> regs;
+        uint32_t insn = iss.instr.data();
+        uint32_t opcode = insn & 0x7F;
+        uint32_t rd = (insn >> 7) & 0x1F;
+        uint32_t funct3 = (insn >> 12) & 0x7;
+
+        uint32_t vlmul_enc = iss.csrs.vtype.reg.fields.vlmul;
+        int8_t signed_vlmul = int8_t(vlmul_enc << 5) >> 5;
+        uint32_t n_regs = 1;
+        if (signed_vlmul > 0) {
+            n_regs = 1 << signed_vlmul;
+        }
+
+        auto add_reg_group = [&](uint32_t base, uint32_t count) {
+            for (uint32_t i = 0; i < count; i++) {
+                if (base + i < 32) regs.push_back(base + i);
+            }
+        };
+
+        if (opcode == 0x57 && funct3 != 7) {
+            add_reg_group(rd, n_regs);
+        } else if (opcode == 0x07) {
+            add_reg_group(rd, n_regs);
+        }
+
         return regs;
     }
 
@@ -112,6 +138,7 @@ class VExtension {
     }
     bool isVectorBusy(uint64_t current_cycle) const {
         if (!timing_enabled_) return false;
+        if (current_cycle < vector_busy_until_cycle_) return true;
         for (int i = 0; i < 32; i++) {
             if (current_cycle < vreg_ready_cycle_[i]) return true;
         }
@@ -120,30 +147,159 @@ class VExtension {
     
     AraFU classifyFU(Operation::OpId opId) const {
         switch (opId) {
+            // Integer ALU
             case Operation::OpId::VADD_VV: case Operation::OpId::VADD_VI: case Operation::OpId::VADD_VX:
             case Operation::OpId::VSUB_VV: case Operation::OpId::VSUB_VX:
-            case Operation::OpId::VAND_VV: case Operation::OpId::VOR_VV: case Operation::OpId::VXOR_VV:
+            case Operation::OpId::VRSUB_VX: case Operation::OpId::VRSUB_VI:
+            case Operation::OpId::VWADD_VV: case Operation::OpId::VWADD_VX: case Operation::OpId::VWADD_WV: case Operation::OpId::VWADD_WX:
+            case Operation::OpId::VWSUB_VV: case Operation::OpId::VWSUB_VX: case Operation::OpId::VWSUB_WV: case Operation::OpId::VWSUB_WX:
+            case Operation::OpId::VWADDU_VV: case Operation::OpId::VWADDU_VX: case Operation::OpId::VWADDU_WV: case Operation::OpId::VWADDU_WX:
+            case Operation::OpId::VWSUBU_VV: case Operation::OpId::VWSUBU_VX: case Operation::OpId::VWSUBU_WV: case Operation::OpId::VWSUBU_WX:
+            case Operation::OpId::VAND_VV: case Operation::OpId::VAND_VI: case Operation::OpId::VAND_VX:
+            case Operation::OpId::VOR_VV: case Operation::OpId::VOR_VI: case Operation::OpId::VOR_VX:
+            case Operation::OpId::VXOR_VV: case Operation::OpId::VXOR_VI: case Operation::OpId::VXOR_VX:
+            case Operation::OpId::VSLL_VV: case Operation::OpId::VSLL_VI: case Operation::OpId::VSLL_VX:
+            case Operation::OpId::VSRL_VV: case Operation::OpId::VSRL_VI: case Operation::OpId::VSRL_VX:
+            case Operation::OpId::VSRA_VV: case Operation::OpId::VSRA_VI: case Operation::OpId::VSRA_VX:
+            case Operation::OpId::VNSRL_WV: case Operation::OpId::VNSRL_WX: case Operation::OpId::VNSRL_WI:
+            case Operation::OpId::VNSRA_WV: case Operation::OpId::VNSRA_WX: case Operation::OpId::VNSRA_WI:
+            case Operation::OpId::VNCLIP_WV: case Operation::OpId::VNCLIP_WX: case Operation::OpId::VNCLIP_WI:
+            case Operation::OpId::VNCLIPU_WV: case Operation::OpId::VNCLIPU_WX: case Operation::OpId::VNCLIPU_WI:
+            case Operation::OpId::VMSEQ_VV: case Operation::OpId::VMSEQ_VI: case Operation::OpId::VMSEQ_VX:
+            case Operation::OpId::VMSNE_VV: case Operation::OpId::VMSNE_VI: case Operation::OpId::VMSNE_VX:
+            case Operation::OpId::VMSLT_VV: case Operation::OpId::VMSLT_VX:
+            case Operation::OpId::VMSLTU_VV: case Operation::OpId::VMSLTU_VX:
+            case Operation::OpId::VMSLE_VV: case Operation::OpId::VMSLE_VI: case Operation::OpId::VMSLE_VX:
+            case Operation::OpId::VMSLEU_VV: case Operation::OpId::VMSLEU_VI: case Operation::OpId::VMSLEU_VX:
+            case Operation::OpId::VMSGT_VI: case Operation::OpId::VMSGT_VX:
+            case Operation::OpId::VMSGTU_VI: case Operation::OpId::VMSGTU_VX:
+            case Operation::OpId::VMIN_VV: case Operation::OpId::VMIN_VX:
+            case Operation::OpId::VMINU_VV: case Operation::OpId::VMINU_VX:
+            case Operation::OpId::VMAX_VV: case Operation::OpId::VMAX_VX:
+            case Operation::OpId::VMAXU_VV: case Operation::OpId::VMAXU_VX:
+            case Operation::OpId::VSADD_VV: case Operation::OpId::VSADD_VI: case Operation::OpId::VSADD_VX:
+            case Operation::OpId::VSADDU_VV: case Operation::OpId::VSADDU_VI: case Operation::OpId::VSADDU_VX:
+            case Operation::OpId::VSSUB_VV: case Operation::OpId::VSSUB_VX:
+            case Operation::OpId::VSSUBU_VV: case Operation::OpId::VSSUBU_VX:
+            case Operation::OpId::VMADC_VVM: case Operation::OpId::VMADC_VXM: case Operation::OpId::VMADC_VIM:
+            case Operation::OpId::VMSBC_VVM: case Operation::OpId::VMSBC_VXM:
+            case Operation::OpId::VADC_VVM: case Operation::OpId::VADC_VXM: case Operation::OpId::VADC_VIM:
+            case Operation::OpId::VSBC_VVM: case Operation::OpId::VSBC_VXM:
+            case Operation::OpId::VMERGE_VVM: case Operation::OpId::VMERGE_VXM: case Operation::OpId::VMERGE_VIM:
+            case Operation::OpId::VMV_V_V: case Operation::OpId::VMV_V_X: case Operation::OpId::VMV_V_I:
+            case Operation::OpId::VMV_S_X: case Operation::OpId::VMV_X_S:
+            case Operation::OpId::VZEXT_VF2: case Operation::OpId::VZEXT_VF4: case Operation::OpId::VZEXT_VF8:
+            case Operation::OpId::VSEXT_VF2: case Operation::OpId::VSEXT_VF4: case Operation::OpId::VSEXT_VF8:
+            case Operation::OpId::VSLIDEUP_VX: case Operation::OpId::VSLIDEUP_VI:
+            case Operation::OpId::VSLIDEDOWN_VX: case Operation::OpId::VSLIDEDOWN_VI:
+            case Operation::OpId::VSLIDE1UP_VX: case Operation::OpId::VSLIDE1DOWN_VX:
+            case Operation::OpId::VRGATHER_VV: case Operation::OpId::VRGATHER_VX: case Operation::OpId::VRGATHER_VI:
+            case Operation::OpId::VRGATHEREI16_VV: case Operation::OpId::VCOMPRESS_VM:
                 return AraFU::VALU;
+
+            // Integer Multiply
             case Operation::OpId::VMUL_VV: case Operation::OpId::VMUL_VX:
-            case Operation::OpId::VMULH_VV: case Operation::OpId::VMULHU_VV:
+            case Operation::OpId::VMULH_VV: case Operation::OpId::VMULH_VX:
+            case Operation::OpId::VMULHU_VV: case Operation::OpId::VMULHU_VX:
+            case Operation::OpId::VMULHSU_VV: case Operation::OpId::VMULHSU_VX:
+            case Operation::OpId::VWMUL_VV: case Operation::OpId::VWMUL_VX:
+            case Operation::OpId::VWMULU_VV: case Operation::OpId::VWMULU_VX:
+            case Operation::OpId::VWMULSU_VV: case Operation::OpId::VWMULSU_VX:
+            case Operation::OpId::VSMUL_VV: case Operation::OpId::VSMUL_VX:
                 return AraFU::VMFPU_MUL;
+
+            // Floating-Point
             case Operation::OpId::VFADD_VV: case Operation::OpId::VFADD_VF:
-            case Operation::OpId::VFMUL_VV: case Operation::OpId::VFMACC_VV:
+            case Operation::OpId::VFSUB_VV: case Operation::OpId::VFSUB_VF:
+            case Operation::OpId::VFRSUB_VF:
+            case Operation::OpId::VFMUL_VV: case Operation::OpId::VFMUL_VF:
+            case Operation::OpId::VFMACC_VV: case Operation::OpId::VFMACC_VF:
+            case Operation::OpId::VFNMACC_VV: case Operation::OpId::VFNMACC_VF:
+            case Operation::OpId::VFMSAC_VV: case Operation::OpId::VFMSAC_VF:
+            case Operation::OpId::VFNMSAC_VV: case Operation::OpId::VFNMSAC_VF:
+            case Operation::OpId::VFMADD_VV: case Operation::OpId::VFMADD_VF:
+            case Operation::OpId::VFNMADD_VV: case Operation::OpId::VFNMADD_VF:
+            case Operation::OpId::VFMSUB_VV: case Operation::OpId::VFMSUB_VF:
+            case Operation::OpId::VFNMSUB_VV: case Operation::OpId::VFNMSUB_VF:
+            case Operation::OpId::VFWADD_VV: case Operation::OpId::VFWADD_VF: case Operation::OpId::VFWADD_WV: case Operation::OpId::VFWADD_WF:
+            case Operation::OpId::VFWSUB_VV: case Operation::OpId::VFWSUB_VF: case Operation::OpId::VFWSUB_WV: case Operation::OpId::VFWSUB_WF:
+            case Operation::OpId::VFWMUL_VV: case Operation::OpId::VFWMUL_VF:
+            case Operation::OpId::VFWMACC_VV: case Operation::OpId::VFWMACC_VF:
+            case Operation::OpId::VFWNMACC_VV: case Operation::OpId::VFWNMACC_VF:
+            case Operation::OpId::VFWMSAC_VV: case Operation::OpId::VFWMSAC_VF:
+            case Operation::OpId::VFWNMSAC_VV: case Operation::OpId::VFWNMSAC_VF:
+            case Operation::OpId::VFMIN_VV: case Operation::OpId::VFMIN_VF:
+            case Operation::OpId::VFMAX_VV: case Operation::OpId::VFMAX_VF:
+            case Operation::OpId::VFSGNJ_VV: case Operation::OpId::VFSGNJ_VF:
+            case Operation::OpId::VFSGNJN_VV: case Operation::OpId::VFSGNJN_VF:
+            case Operation::OpId::VFSGNJX_VV: case Operation::OpId::VFSGNJX_VF:
+            case Operation::OpId::VMFEQ_VV: case Operation::OpId::VMFEQ_VF:
+            case Operation::OpId::VMFNE_VV: case Operation::OpId::VMFNE_VF:
+            case Operation::OpId::VMFLT_VV: case Operation::OpId::VMFLT_VF:
+            case Operation::OpId::VMFLE_VV: case Operation::OpId::VMFLE_VF:
+            case Operation::OpId::VMFGT_VF: case Operation::OpId::VMFGE_VF:
+            case Operation::OpId::VFCVT_X_F_V: case Operation::OpId::VFCVT_XU_F_V:
+            case Operation::OpId::VFCVT_F_X_V: case Operation::OpId::VFCVT_F_XU_V:
+            case Operation::OpId::VFCVT_RTZ_X_F_V: case Operation::OpId::VFCVT_RTZ_XU_F_V:
+            case Operation::OpId::VFWCVT_X_F_V: case Operation::OpId::VFWCVT_XU_F_V:
+            case Operation::OpId::VFWCVT_F_X_V: case Operation::OpId::VFWCVT_F_XU_V:
+            case Operation::OpId::VFWCVT_RTZ_X_F_V: case Operation::OpId::VFWCVT_RTZ_XU_F_V:
+            case Operation::OpId::VFWCVT_F_F_V:
+            case Operation::OpId::VFNCVT_X_F_W: case Operation::OpId::VFNCVT_XU_F_W:
+            case Operation::OpId::VFNCVT_F_X_W: case Operation::OpId::VFNCVT_F_XU_W:
+            case Operation::OpId::VFNCVT_RTZ_X_F_W: case Operation::OpId::VFNCVT_RTZ_XU_F_W:
+            case Operation::OpId::VFNCVT_F_F_W: case Operation::OpId::VFNCVT_ROD_F_F_W:
+            case Operation::OpId::VFMV_V_F: case Operation::OpId::VFMV_S_F: case Operation::OpId::VFMV_F_S:
+            case Operation::OpId::VFCLASS_V: case Operation::OpId::VFMERGE_VFM:
+            case Operation::OpId::VFSLIDE1UP_VF: case Operation::OpId::VFSLIDE1DOWN_VF:
                 return AraFU::VMFPU_FMA;
-            case Operation::OpId::VDIV_VV: case Operation::OpId::VDIVU_VV:
+
+            // Integer Division & FP Division/Sqrt
+            case Operation::OpId::VDIV_VV: case Operation::OpId::VDIV_VX:
+            case Operation::OpId::VDIVU_VV: case Operation::OpId::VDIVU_VX:
+            case Operation::OpId::VREM_VV: case Operation::OpId::VREM_VX:
+            case Operation::OpId::VREMU_VV: case Operation::OpId::VREMU_VX:
+            case Operation::OpId::VFDIV_VV: case Operation::OpId::VFDIV_VF:
+            case Operation::OpId::VFRDIV_VF: case Operation::OpId::VFSQRT_V:
                 return AraFU::VDVU;
+
+            // Unit-stride Load / Store
             case Operation::OpId::VLE8_V: case Operation::OpId::VLE16_V: case Operation::OpId::VLE32_V: case Operation::OpId::VLE64_V:
             case Operation::OpId::VSE8_V: case Operation::OpId::VSE16_V: case Operation::OpId::VSE32_V: case Operation::OpId::VSE64_V:
+            case Operation::OpId::VLM_V: case Operation::OpId::VSM_V:
+            case Operation::OpId::VL1RE8_V: case Operation::OpId::VL1RE16_V: case Operation::OpId::VL1RE32_V: case Operation::OpId::VL1RE64_V:
+            case Operation::OpId::VL2RE8_V: case Operation::OpId::VL2RE16_V: case Operation::OpId::VL2RE32_V: case Operation::OpId::VL2RE64_V:
+            case Operation::OpId::VL4RE8_V: case Operation::OpId::VL4RE16_V: case Operation::OpId::VL4RE32_V: case Operation::OpId::VL4RE64_V:
+            case Operation::OpId::VL8RE8_V: case Operation::OpId::VL8RE16_V: case Operation::OpId::VL8RE32_V: case Operation::OpId::VL8RE64_V:
+            case Operation::OpId::VS1R_V: case Operation::OpId::VS2R_V: case Operation::OpId::VS4R_V: case Operation::OpId::VS8R_V:
+            case Operation::OpId::VLE8FF_V: case Operation::OpId::VLE16FF_V: case Operation::OpId::VLE32FF_V: case Operation::OpId::VLE64FF_V:
                 return AraFU::VLSU_UNIT;
+
+            // Strided Load / Store
             case Operation::OpId::VLSE8_V: case Operation::OpId::VLSE16_V: case Operation::OpId::VLSE32_V: case Operation::OpId::VLSE64_V:
             case Operation::OpId::VSSE8_V: case Operation::OpId::VSSE16_V: case Operation::OpId::VSSE32_V: case Operation::OpId::VSSE64_V:
                 return AraFU::VLSU_STRIDED;
+
+            // Gather / Indexed Load / Store
+            case Operation::OpId::VLUXEI8_V: case Operation::OpId::VLUXEI16_V: case Operation::OpId::VLUXEI32_V: case Operation::OpId::VLUXEI64_V:
             case Operation::OpId::VLOXEI8_V: case Operation::OpId::VLOXEI16_V: case Operation::OpId::VLOXEI32_V: case Operation::OpId::VLOXEI64_V:
+            case Operation::OpId::VSUXEI8_V: case Operation::OpId::VSUXEI16_V: case Operation::OpId::VSUXEI32_V: case Operation::OpId::VSUXEI64_V:
+            case Operation::OpId::VSOXEI8_V: case Operation::OpId::VSOXEI16_V: case Operation::OpId::VSOXEI32_V: case Operation::OpId::VSOXEI64_V:
                 return AraFU::VLSU_GATHER;
-            case Operation::OpId::VREDSUM_VS: case Operation::OpId::VREDMAX_VS: case Operation::OpId::VREDMIN_VS:
+
+            // Integer Reductions
+            case Operation::OpId::VREDSUM_VS: case Operation::OpId::VREDMAX_VS: case Operation::OpId::VREDMAXU_VS:
+            case Operation::OpId::VREDMIN_VS: case Operation::OpId::VREDMINU_VS:
+            case Operation::OpId::VREDAND_VS: case Operation::OpId::VREDOR_VS: case Operation::OpId::VREDXOR_VS:
+            case Operation::OpId::VWREDSUM_VS: case Operation::OpId::VWREDSUMU_VS:
                 return AraFU::VREDU_INT;
+
+            // Floating-Point Reductions
             case Operation::OpId::VFREDUSUM_VS: case Operation::OpId::VFREDOSUM_VS:
+            case Operation::OpId::VFREDMAX_VS: case Operation::OpId::VFREDMIN_VS:
+            case Operation::OpId::VFWREDUSUM_VS: case Operation::OpId::VFWREDOSUM_VS:
                 return AraFU::VREDU_FP;
+
             default:
                 return AraFU::VALU;
         }
@@ -456,18 +612,18 @@ class VExtension {
 			};
 			
 			uint64_t cycles = 0;
-			if (desc.fu == AraFU::VLSU_UNIT || desc.fu == AraFU::VLSU_STRIDED || desc.fu == AraFU::VLSU_GATHER) {
+			if (desc.fu == AraFU::VLSU_UNIT) {
 			    cycles = timing_model_->computePipelineOverhead(desc);
 			} else {
 			    cycles = timing_model_->computeCycles(desc);
 			}
 			
 			uint64_t now = iss.get_cycle_count();
-            std::vector<uint32_t> regs = get_accessed_vregs();
-            for (uint32_t r : regs) {
-                vreg_ready_cycle_[r] = now + cycles;
-            }
-            std::cout << "DEBUG: vl=" << desc.vl << " sew=" << desc.ew << " lmul=" << desc.lmul << " cycles=" << cycles << std::endl;
+			vector_busy_until_cycle_ = now + cycles;
+			std::vector<uint32_t> dst_regs = get_dest_vregs();
+			for (uint32_t r : dst_regs) {
+				vreg_ready_cycle_[r] = now + cycles;
+			}
 			iss.inject_cycles(timing_model_->computeIssueLatency(desc));
 		}
 	}

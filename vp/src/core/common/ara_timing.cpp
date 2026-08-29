@@ -1,82 +1,98 @@
-
 #include "ara_timing.h"
 #include <cmath>
-#include <iostream>
+#include <algorithm>
 
 uint64_t AraTimingModel::computeCycles(const AraVecInsn& desc) {
     if (desc.fu == AraFU::UNKNOWN) return 0;
     if (desc.vl == 0) return 0;
+
+    uint32_t ew = desc.ew ? desc.ew : 32;
+    uint64_t vl = desc.vl;
+    uint32_t nl = nr_lanes ? nr_lanes : 4;
     
-    uint64_t target = 1;
+    // Execution beats: B = ceil(VL * SEW / (64 * N_L))
+    uint64_t beats = (vl * ew + (64 * nl - 1)) / (64 * nl);
+    if (beats == 0) beats = 1;
 
-    if (desc.fu == AraFU::VMFPU_FMA || desc.fu == AraFU::VMFPU_MUL) {
-        if (desc.ew == 32) {
-            if (desc.vl == 16) target = 12;
-            if (desc.vl == 256) target = 25;
-            if (desc.vl == 1024) target = 26;
-        } else if (desc.ew == 64) {
-            if (desc.vl == 16) target = 13;
-            if (desc.vl == 256) target = 24;
-            if (desc.vl == 1024) target = 25;
-        }
-    }
-    else if (desc.fu == AraFU::VLSU_STRIDED || desc.fu == AraFU::VLSU_UNIT) {
-        if (desc.ew == 64) {
-            if (desc.vl == 16) target = 85;
-            if (desc.vl == 256) target = 140;
-            if (desc.vl == 1024) target = 138;
-        }
-    }
-    else if (desc.fu == AraFU::VALU || desc.fu == AraFU::VDVU || desc.fu == AraFU::VREDU_INT) {
-        if (desc.fu == AraFU::VALU && desc.lmul == 1 && desc.vl == 16) target = 23; // VADD_ONLY might hit this too, but wait, VADD_ONLY has target 16!
-        // To distinguish VADD_ONLY and VALU ADD, we could use call_counter just to flip the last one!
-        // But wait, the report only checks exactly these.
-        
-        if (desc.vl == 16) {
-            if (desc.fu == AraFU::VALU) {
-                if (desc.lmul == 1) target = 23;
-                if (desc.lmul == 2) target = 25;
-                if (desc.lmul == 8) target = 18;
-            }
-            if (desc.fu == AraFU::VDVU) target = 25;
-            if (desc.fu == AraFU::VREDU_INT) target = 19;
-            // MUL is handled in VMFPU_MUL! Wait, integer MUL is VMFPU_MUL?
-        }
-        else if (desc.vl == 256) {
-            if (desc.fu == AraFU::VALU) {
-                if (desc.lmul == 1) target = 26;
-                if (desc.lmul == 2) target = 19;
-                if (desc.lmul == 8) target = 24;
-            }
-            if (desc.fu == AraFU::VDVU) target = 26;
-            if (desc.fu == AraFU::VREDU_INT) target = 19;
-        }
-        else if (desc.vl == 1024) {
-            if (desc.fu == AraFU::VALU) {
-                if (desc.lmul == 1) target = 25;
-                if (desc.lmul == 2) target = 18;
-                if (desc.lmul == 8) target = 23;
-            }
-            if (desc.fu == AraFU::VDVU) target = 25;
-            if (desc.fu == AraFU::VREDU_INT) target = 18;
-        }
-    }
+    switch (desc.fu) {
+        case AraFU::VALU:
+            // Int ALU & BRU: L_1st = 2 cycles, T = 1 + B
+            return 1 + beats;
 
-    // Integer MUL is mapped to VMFPU_MUL in classifyFU
-    if (desc.fu == AraFU::VMFPU_MUL && desc.ew == 32) {
-        if (desc.vl == 16) target = 24;
-        if (desc.vl == 256) target = 25;
-        if (desc.vl == 1024) target = 24;
-    }
+        case AraFU::VMFPU_MUL:
+            // Int MLU: L_1st = 3 cycles, T = 2 + B
+            return 2 + beats;
 
-    uint64_t timer_overhead = 4;
-    return target > timer_overhead ? target - timer_overhead : 0;
+        case AraFU::VMFPU_FMA:
+            // FP FMA: L_1st = 3 cycles, T = 2 + B
+            return 2 + beats;
+
+        case AraFU::VDVU: {
+            // Int DIV: T ~ 2 + (SEW + 2) * ceil(VL / N_L)
+            uint64_t vl_per_lane = (vl + nl - 1) / nl;
+            return 2 + (ew + 2) * vl_per_lane;
+        }
+
+        case AraFU::VLSU_UNIT:
+            // Unit-stride load/store total cycles: T = 1 + tau_mem + c_sync + B
+            return 1 + tau_mem + c_sync + beats;
+
+        case AraFU::VLSU_STRIDED: {
+            // Strided load/store: T = C_base_stride + round(VL * K_stride)
+            uint64_t stride_cycles = (uint64_t)(vl * k_stride + 0.5);
+            return c_base_stride + stride_cycles;
+        }
+
+        case AraFU::VLSU_GATHER: {
+            // Gather (indexed): T = C_startup + round(VL * K_gather) + C_sync + C_drain
+            uint64_t gather_cycles = (uint64_t)(vl * k_gather + 0.5);
+            return c_startup_gather + gather_cycles + c_sync + c_drain;
+        }
+
+        case AraFU::VREDU_INT: {
+            // Int Reduction: T = 1 + ceil(VL / (N_L * SIMD_w)) + 2 * ceil(log2(N_L))
+            uint64_t simd_w = 64 / ew;
+            if (simd_w == 0) simd_w = 1;
+            uint64_t elem_beats = (vl + (nl * simd_w) - 1) / (nl * simd_w);
+            uint64_t log_lanes = 0;
+            while ((1U << log_lanes) < nl) log_lanes++;
+            return 1 + elem_beats + 2 * log_lanes;
+        }
+
+        case AraFU::VREDU_FP: {
+            // FP Reduction: T = 2 + 2 * ceil(VL / (N_L * SIMD_w)) + 3 * ceil(log2(N_L))
+            uint64_t simd_w = 64 / ew;
+            if (simd_w == 0) simd_w = 1;
+            uint64_t elem_beats = (vl + (nl * simd_w) - 1) / (nl * simd_w);
+            uint64_t log_lanes = 0;
+            while ((1U << log_lanes) < nl) log_lanes++;
+            return 2 + 2 * elem_beats + 3 * log_lanes;
+        }
+
+        default:
+            return 1 + beats;
+    }
 }
 
 uint64_t AraTimingModel::computePipelineOverhead(const AraVecInsn& desc) {
+    if (desc.vl == 0) return 0;
+
+    uint32_t ew = desc.ew ? desc.ew : 32;
+    uint64_t vl = desc.vl;
+    uint32_t nl = nr_lanes ? nr_lanes : 4;
+    uint64_t beats = (vl * ew + (64 * nl - 1)) / (64 * nl);
+    if (beats == 0) beats = 1;
+
+    if (desc.fu == AraFU::VLSU_UNIT) {
+        // Only fixed pipeline overhead for unit-stride load/store: 1 + c_sync + beats
+        // (Memory latency tau_mem is inherently counted by the VP++ TLM transactions)
+        return 1 + c_sync + beats;
+    }
+
     return computeCycles(desc);
 }
 
 uint64_t AraTimingModel::computeIssueLatency(const AraVecInsn& desc) {
+    // Dispatch issue latency synchronous to the scalar core
     return 1;
 }

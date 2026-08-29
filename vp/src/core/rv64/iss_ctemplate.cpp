@@ -354,12 +354,30 @@ static inline bool is_vector_op(Operation::OpId opId) {
     return opId >= Operation::OpId::VSETVLI && opId < Operation::OpId::NUMBER_OF_OPERATIONS;
 }
 
+static inline bool is_exempt_from_scalar_hiding(Operation::OpId opId) {
+    switch (opId) {
+        case Operation::OpId::CSRRW:
+        case Operation::OpId::CSRRS:
+        case Operation::OpId::CSRRC:
+        case Operation::OpId::CSRRWI:
+        case Operation::OpId::CSRRSI:
+        case Operation::OpId::CSRRCI:
+        case Operation::OpId::FENCE:
+        case Operation::OpId::FENCE_I:
+        case Operation::OpId::ECALL:
+        case Operation::OpId::EBREAK:
+            return true;
+        default:
+            return false;
+    }
+}
+
 #define OP_CASE(_op)                                                                                                 \
 	OP_LABEL_OP(_op)                                                                                                 \
 	    : static struct op_label_entry OP_LABEL_ENTRY_OP(_op)                                                        \
 	          __attribute__((used, section(OP_LABLE_ENTRIES_SEC_STR))) = {Operation::OpId::_op, &&OP_LABEL_OP(_op)}; \
 	stats.inc_op(Operation::OpId::_op); \
-	if (v_ext.timingEnabled() && !is_vector_op(Operation::OpId::_op)) { \
+	if (v_ext.timingEnabled() && !is_vector_op(Operation::OpId::_op) && !is_exempt_from_scalar_hiding(Operation::OpId::_op)) { \
 		uint64_t now = dbbcache.get_cycle_counter_raw() / prop_clock_cycle_period.value(); \
 		if (v_ext.isVectorBusy(now)) { \
 			dbbcache.inject_cycles(- (int64_t)opMap[Operation::OpId::_op].instr_time); \
