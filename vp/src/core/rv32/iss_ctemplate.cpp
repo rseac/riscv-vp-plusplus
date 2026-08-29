@@ -6528,6 +6528,13 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VCPOP_M) {
+					if (v_ext.timingEnabled()) {
+						uint64_t ready = v_ext.get_vreg_ready_cycle(instr.rs2());
+						uint64_t now = get_cycle_count();
+						if (now < ready) {
+							inject_cycles(ready - now);
+						}
+					}
 					v_ext.prepInstr(true, true, false);
 					v_ext.vCpop();
 					v_ext.finishInstr(false);
@@ -6535,6 +6542,13 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VFIRST_M) {
+					if (v_ext.timingEnabled()) {
+						uint64_t ready = v_ext.get_vreg_ready_cycle(instr.rs2());
+						uint64_t now = get_cycle_count();
+						if (now < ready) {
+							inject_cycles(ready - now);
+						}
+					}
 					v_ext.prepInstr(true, true, false);
 					v_ext.vFirst();
 					v_ext.finishInstr(false);
@@ -6577,6 +6591,13 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VMV_X_S) {
+					if (v_ext.timingEnabled()) {
+						uint64_t ready = v_ext.get_vreg_ready_cycle(instr.rs2());
+						uint64_t now = get_cycle_count();
+						if (now < ready) {
+							inject_cycles(ready - now);
+						}
+					}
 					v_ext.prepInstr(true, true, false);
 					v_ext.vMvXs();
 					v_ext.finishInstr(false);
@@ -6591,6 +6612,13 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_END();
 
 				OP_CASE(VFMV_F_S) {
+					if (v_ext.timingEnabled()) {
+						uint64_t ready = v_ext.get_vreg_ready_cycle(instr.rs2());
+						uint64_t now = get_cycle_count();
+						if (now < ready) {
+							inject_cycles(ready - now);
+						}
+					}
 					v_ext.prepInstr(true, true, true);
 					v_ext.vMvFs();
 					v_ext.finishInstr(true);

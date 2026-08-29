@@ -102,6 +102,14 @@ class VExtension {
     }
     
     bool timingEnabled() const { return timing_enabled_; }
+    bool is_vreg_ready(uint32_t reg, uint64_t current_cycle) const {
+        if (!timing_enabled_) return true;
+        return current_cycle >= vreg_ready_cycle_[reg];
+    }
+    uint64_t get_vreg_ready_cycle(uint32_t reg) const {
+        if (!timing_enabled_) return 0;
+        return vreg_ready_cycle_[reg];
+    }
     bool isVectorBusy(uint64_t current_cycle) const {
         if (!timing_enabled_) return false;
         for (int i = 0; i < 32; i++) {
