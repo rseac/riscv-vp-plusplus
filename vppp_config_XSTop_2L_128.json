@@ -136,9 +136,9 @@
   "vppp.ISS.Core-0.xs_dlen": "128",
   "vppp.ISS.Core-0.xs_nr_lanes": "2",
   "_comment_vector_tunables": "MEDIUM/LOW constants exposed for the calibrator (decimal-in-hex).",
-  "vppp.ISS.Core-0.xs_c_dep_resync": "0x4",
-  "vppp.ISS.Core-0.xs_c_uop_arith": "0x2",
-  "vppp.ISS.Core-0.xs_c_fill": "0x5",
+  "vppp.ISS.Core-0.xs_c_dep_resync": "0x1",
+  "vppp.ISS.Core-0.xs_c_uop_arith": "0x0",
+  "vppp.ISS.Core-0.xs_c_fill": "0x4",
   "vppp.ISS.Core-0.xs_c_uop_red_x10": "0xc",
   "vppp.ISS.Core-0.xs_c_perm_uop": "0x2",
   "vppp.ISS.Core-0.xs_l_fadd": "0x3",
@@ -148,5 +148,6 @@
   "vppp.ISS.Core-0.xs_c_reissue": "0x2",
   "vppp.ISS.Core-0.xs_t_l1hit": "0x3",
   "vppp.ISS.Core-0.xs_tau_mem": "0xa",
-  "_comment_calibration": "Step10: scalar FP constants calibrated to EMPIRICAL rtl_calibration.md (fcmp/fcvt reflect FP->GPR serialization: feq=13, fcvt=15, fdiv=15). fadd=3,fmul/fmadd=4,mul=3,load=4."
+  "_comment_calibration": "Step10: scalar FP constants calibrated to EMPIRICAL rtl_calibration.md (fcmp/fcvt reflect FP->GPR serialization: feq=13, fcvt=15, fdiv=15). fadd=3,fmul/fmadd=4,mul=3,load=4.",
+  "_comment_arith_flat": "Phase-4 fix: vector arith dependent-chain latency is LMUL-FLAT per RTL (vadd m1..m8=5.9..6.4). L = c_fill + L_core + c_dep_resync; per-uop streamed increment c_uop_arith=0. LMUL cost is carried in n_beats (FU occupancy), not consumer-visible latency."
 }

@@ -266,8 +266,13 @@ class XsTimingModel {
 		XsInstLatency out{0, 0};
 		switch (desc.fu) {
 			// ---- Element-wise vector arithmetic (math model §5.3, 6.2) ----
-			// Dependent chain: L = numOfUop*(L_core + C_dep_resync) + C_fill,
-			// arith uops overlap => fill-dominated m1..m8 curve.
+			// DEPENDENT-CHAIN latency: on the unified OoO backend the LMUL uops
+			// PIPELINE, so the consumer of a dependent chain only waits for the
+			// pipeline latency of the operation — NOT numUop * per-uop latency.
+			// RTL (vadd_m1..m8 = 5.9..6.4 cyc/op) is nearly LMUL-FLAT: the first
+			// uop pays fill + L_core + resync; the remaining (numUop-1) uops
+			// stream and add only a small per-uop increment (c_uop_arith, ~0).
+			// Occupancy (n_beats) still scales with numUop for FU-busy accounting.
 			case XsFU::VALU:
 			case XsFU::VMFPU_MUL:
 			case XsFU::VMFPU_FMA:
@@ -276,7 +281,8 @@ class XsTimingModel {
 			case XsFU::VNARROW:
 			case XsFU::VMASK: {
 				uint32_t nuop = numOfUopArith(desc);
-				uint64_t L = (uint64_t)nuop * (lcore(desc) + cfg_.c_dep_resync) + cfg_.c_fill;
+				uint64_t L = cfg_.c_fill + lcore(desc) + cfg_.c_dep_resync
+				             + (uint64_t)(nuop - 1) * cfg_.c_uop_arith;
 				out.total_cycles = L;
 				out.n_beats = (uint64_t)nuop * cfg_.c_uop_arith;
 				break;
