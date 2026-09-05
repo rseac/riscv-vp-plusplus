@@ -1,0 +1,4 @@
+{
+  "_comment": "Timing-OFF config for Tier-1 hooks-alive comparison (same binary).",
+  "vppp.ISS.Core-0.xs_timing_enabled": "0"
+}

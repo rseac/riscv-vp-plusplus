@@ -69,6 +69,13 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	VExtension<ISS_CT> v_ext;
 	PrivilegeLevel prv = MachineMode;
 
+	// XSTop timing-model shims (timing engine is only enabled on rv64; these
+	// keep the shared VExtension::finishInstr() template instantiable here).
+	__always_inline void xs_inject_cycles(uint64_t n_cycles) {
+		dbbcache.add_cycle_counter_raw(n_cycles * prop_clock_cycle_period.value());
+	}
+	__always_inline uint64_t get_clock_cycle_period_ps() { return prop_clock_cycle_period.value(); }
+
 	// last decoded and executed instruction
 	Instruction instr;
 

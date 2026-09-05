@@ -7,6 +7,7 @@ add_library(core-common
 		debug_memory.cpp
 		rawmode.cpp
 		iss_stats.cpp
+		xs_timing.cpp
 		${HEADERS})
 
 target_link_libraries(core-common PRIVATE pthread systemc)

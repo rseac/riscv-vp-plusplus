@@ -162,6 +162,113 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 		/* set instruction time */
 		opMap[opId].instr_time = instr_clock_cycles * prop_clock_cycle_period.value(); /* ps */
 	}
+
+	/*
+	 * ===================== XSTop Vector Timing Model (Profile B) =====================
+	 *
+	 * Target microarchitecture: unified_ooo (project_config.json hardware.vector_arch).
+	 * XSTop is a unified out-of-order superscalar core with an integrated RVV back-end.
+	 * There is NO decoupled vector coprocessor and NO ARI queue, so scalar hiding is
+	 * DISABLED (enable_scalar_hiding = 0). Overlap is modeled purely via the per-vector-
+	 * register RAW/WAW scoreboard inside VExtension, and all timing is ADDITIVE
+	 * (positive cycle injection only) — never a credit/subtract path.
+	 *
+	 * MEDIUM/LOW "tunable" constants are exposed via the property tree so the
+	 * @simulator_calibrator can tune them; FIXED structural DFF depths are hardcoded
+	 * defaults in xs_timing::XsConfig and are NOT tuned.
+	 */
+	{
+		uint64_t xs_timing_enabled = 1;
+		VPPP_PROPERTY_GET("ISS." + name(), "xs_timing_enabled", uint64_t, xs_timing_enabled);
+
+		if (xs_timing_enabled) {
+			xs_timing::XsConfig xs_cfg;
+			uint64_t tmp;
+
+			/* --- Fixed structural (overridable for cross-config sweeps) --- */
+			tmp = xs_cfg.vlen;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_vlen", uint64_t, tmp);
+			xs_cfg.vlen = (uint32_t)tmp;
+
+			tmp = xs_cfg.dlen;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_dlen", uint64_t, tmp);
+			xs_cfg.dlen = (uint32_t)tmp;
+
+			tmp = xs_cfg.nr_lanes;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_nr_lanes", uint64_t, tmp);
+			xs_cfg.nr_lanes = (uint32_t)tmp;
+
+			/* Profile B: scalar hiding MUST stay 0 for a unified OoO core. */
+			tmp = xs_cfg.enable_scalar_hiding;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_enable_scalar_hiding", uint64_t, tmp);
+			xs_cfg.enable_scalar_hiding = (uint32_t)tmp;
+
+			/* --- MEDIUM structural constants (tunable) --- */
+			tmp = xs_cfg.c_dep_resync;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_c_dep_resync", uint64_t, tmp);
+			xs_cfg.c_dep_resync = (uint32_t)tmp;
+
+			tmp = xs_cfg.c_uop_arith;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_c_uop_arith", uint64_t, tmp);
+			xs_cfg.c_uop_arith = (uint32_t)tmp;
+
+			tmp = xs_cfg.c_fill;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_c_fill", uint64_t, tmp);
+			xs_cfg.c_fill = (uint32_t)tmp;
+
+			tmp = xs_cfg.c_uop_red_x10;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_c_uop_red_x10", uint64_t, tmp);
+			xs_cfg.c_uop_red_x10 = (uint32_t)tmp;
+
+			tmp = xs_cfg.c_perm_uop;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_c_perm_uop", uint64_t, tmp);
+			xs_cfg.c_perm_uop = (uint32_t)tmp;
+
+			/* --- LOW empirical anchors (tunable) --- */
+			tmp = xs_cfg.l_fadd;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_l_fadd", uint64_t, tmp);
+			xs_cfg.l_fadd = (uint32_t)tmp;
+
+			tmp = xs_cfg.c_strided_flow;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_c_strided_flow", uint64_t, tmp);
+			xs_cfg.c_strided_flow = (uint32_t)tmp;
+
+			tmp = xs_cfg.p_line_max;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_p_line_max", uint64_t, tmp);
+			xs_cfg.p_line_max = (uint32_t)tmp;
+
+			tmp = xs_cfg.c_gather_rt_x10;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_c_gather_rt_x10", uint64_t, tmp);
+			xs_cfg.c_gather_rt_x10 = (uint32_t)tmp;
+
+			tmp = xs_cfg.c_reissue;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_c_reissue", uint64_t, tmp);
+			xs_cfg.c_reissue = (uint32_t)tmp;
+
+			/* --- Memory (tunable / UNVALIDATED off-die) --- */
+			tmp = xs_cfg.t_l1hit;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_t_l1hit", uint64_t, tmp);
+			xs_cfg.t_l1hit = (uint32_t)tmp;
+
+			tmp = xs_cfg.tau_mem;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_tau_mem", uint64_t, tmp);
+			xs_cfg.tau_mem = (uint32_t)tmp;
+
+			/* Initialize the dynamic timing engine in VExtension. */
+			v_ext.initTimingModel(xs_cfg);
+
+			/*
+			 * Disable static per-instruction timing for ALL vector OpIds. Their
+			 * latency is injected dynamically from finishInstr(). Scalar OpIds keep
+			 * their property-tree / RTL-calibrated static latencies (Profile B REQUIRES
+			 * scalar timing to be honored, not hidden).
+			 */
+			for (unsigned int opId = Operation::OpId::VSETVLI;
+			     opId <= Operation::OpId::VMV_NR_R_V; ++opId) {
+				opMap[opId].instr_time = 0;
+			}
+		}
+	}
 }
 
 void ISS_CT::print_trace() {
@@ -337,7 +444,8 @@ void *ISS_CT::genOpMap() {
 	OP_LABEL_OP(_op)                                                                                                 \
 	    : static struct op_label_entry OP_LABEL_ENTRY_OP(_op)                                                        \
 	          __attribute__((used, section(OP_LABLE_ENTRIES_SEC_STR))) = {Operation::OpId::_op, &&OP_LABEL_OP(_op)}; \
-	stats.inc_op(Operation::OpId::_op);
+	stats.inc_op(Operation::OpId::_op);                                                                              \
+	v_ext.setCurrentOpId(Operation::OpId::_op);
 
 #define OP_INVALID_END()                                                                                             \
 	if (trace) {                                                                                                     \

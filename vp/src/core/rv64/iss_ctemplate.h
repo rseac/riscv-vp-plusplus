@@ -143,6 +143,46 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		ninstr_last = ninstr;
 	}
 
+	/**
+	 * XSTop Profile B timing model helpers.
+	 *
+	 * xs_inject_cycles(): add N clock cycles (converted to ps) into the dbbcache
+	 * cycle counter. POSITIVE injection only — there is no credit/subtract path on
+	 * the unified-OoO model, which structurally avoids the quantum-keeper underflow
+	 * hang described in the integration spec.
+	 */
+	__always_inline void xs_inject_cycles(uint64_t n_cycles) {
+		uint64_t ps = n_cycles * prop_clock_cycle_period.value();
+		dbbcache.add_cycle_counter_raw(ps);
+	}
+
+	__always_inline uint64_t get_clock_cycle_period_ps() {
+		return prop_clock_cycle_period.value();
+	}
+
+	/**
+	 * Sync hook for coprocessor-to-scalar extract ops and serializing ops.
+	 *
+	 * Profile B (unified_ooo): there is NO ARI queue and NO scalar hiding. The only
+	 * true cross-domain data hazard is the extract/move-from-vector family and the
+	 * mask popcount/first ops, where the scalar consumer must wait for the source
+	 * vector result. We stall on the SOURCE vector register (vs2 for OPMVV extracts).
+	 * CSR/FENCE/ECALL are left to the scalar core's own timing — we do NOT force an
+	 * extra vector sync for them here (that is a decoupled-coprocessor behaviour).
+	 */
+	__always_inline void xs_sync_vector(Operation::OpId opId) {
+		switch (opId) {
+			case Operation::OpId::VMV_X_S:
+			case Operation::OpId::VFMV_F_S:
+			case Operation::OpId::VCPOP_M:
+			case Operation::OpId::VFIRST_M:
+				v_ext.syncOnExtract(instr.rs2());
+				return;
+			default:
+				break;
+		}
+	}
+
 	uint64_t _compute_and_get_current_cycles();
 
 	void init(instr_memory_if *instr_mem, bool use_dbbcache, data_memory_if *data_mem, bool use_lscache,

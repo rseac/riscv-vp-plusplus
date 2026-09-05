@@ -316,6 +316,10 @@ class DBBCacheDummy_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if
 		return cycle_counter_raw;
 	}
 
+	__always_inline void add_cycle_counter_raw(uint64_t ps) {
+		cycle_counter_raw += ps;
+	}
+
 	uint32_t get_mem_word() {
 		return this->mem_word;
 	}

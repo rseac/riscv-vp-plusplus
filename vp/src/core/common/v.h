@@ -3,6 +3,10 @@
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cstring>
 
+// --- XSTop (unified_ooo) Timing Model, Profile B ---
+#include "xs_timing.h"
+#include "xs_timing_classify.h"
+
 /*
  * print unmet traps (reasons) to stdout
  * (see v_assert)
@@ -27,6 +31,62 @@ class VExtension {
    private:
 	void* v_regs;  // TODO: could be initialized randomly
 	iss_type& iss;
+
+	// ===================== XSTop Profile B Timing Model =====================
+	// Target microarchitecture: unified_ooo (project_config.json hardware.vector_arch).
+	// There is NO decoupled coprocessor / NO ARI queue. Overlap is modeled via a
+	// per-vector-register scoreboard (RAW/WAW) ONLY. Timing is ADDITIVE (positive
+	// cycle injection only) — there is no credit/subtract path, structurally avoiding
+	// the SystemC quantum-keeper unsigned-underflow hang.
+	xs_timing::XsTimingModel* timing_model_ = nullptr;
+	Operation::OpId current_opId_ = Operation::OpId::NUMBER_OF_OPERATIONS;
+	bool timing_enabled_ = false;
+
+	// Per-vector-register scoreboard: absolute cycle at which register v[i]'s
+	// result becomes available. Used ONLY to add RAW/WAW stalls (never to credit).
+	uint64_t vreg_ready_cycle_[NUM_REGS] = {0};
+
+	// Fixed synchronous issue latency injected for every dispatched vector op
+	// (models the in-order front-end accept cost W_v). Kept small & positive.
+	uint32_t issue_latency_ = 1;
+
+	// Current cycle from the dbbcache (picoseconds -> cycles).
+	uint64_t nowCycle() const {
+		uint64_t period = iss.get_clock_cycle_period_ps();
+		if (period == 0) return 0;
+		return iss.dbbcache.get_cycle_counter_raw() / period;
+	}
+
+	// Compute the LMUL register-group span (1,2,4,8) for scoreboard clustering.
+	static uint32_t lmulSpan(uint32_t vlmul_field) {
+		if (vlmul_field <= 3) return 1u << vlmul_field;  // 1,2,4,8
+		return 1;                                        // fractional LMUL -> 1 reg
+	}
+
+   public:
+	// -------------------- Timing model lifecycle --------------------
+	void initTimingModel(const xs_timing::XsConfig& cfg) {
+		timing_model_ = new xs_timing::XsTimingModel(cfg);
+		timing_enabled_ = true;
+	}
+	bool timingEnabled() const { return timing_enabled_; }
+	void setCurrentOpId(Operation::OpId opId) { current_opId_ = opId; }
+
+	// Extract-from-vector ops (vmv.x.s, vfmv.f.s, vcpop.m, vfirst.m) force the
+	// consumer (scalar core) to wait for the source vector result. Valid data
+	// hazard in both profiles. Called from the ISS sync hook for these OpIds.
+	void syncOnExtract(uint32_t vsrc) {
+		if (!timing_enabled_ || !timing_model_) return;
+		if (vsrc >= NUM_REGS) return;
+		uint64_t now = nowCycle();
+		if (now < vreg_ready_cycle_[vsrc]) {
+			uint64_t stall = vreg_ready_cycle_[vsrc] - now;  // positive only
+			iss.xs_inject_cycles(stall);
+		}
+	}
+
+   private:
+	// ========================================================================
 
    public:
 	constexpr static unsigned VS_OFF = 0b00;
@@ -82,6 +142,11 @@ class VExtension {
 		iss.csrs.vlenb.reg.val = VLENB;
 		v_regs = malloc(NUM_REGS * VLENB);
 		memset(v_regs, 0, NUM_REGS * VLENB);
+	}
+
+	~VExtension() {
+		delete timing_model_;
+		free(v_regs);
 	}
 
 	template <typename T>
@@ -296,6 +361,117 @@ class VExtension {
 		if (is_fp) {
 			iss.fp_finish_instr();
 		}
+
+		// ============ XSTop Profile B: dynamic vector cycle injection ============
+		// Positive injection ONLY. Overlap comes from the RAW/WAW scoreboard, NOT
+		// from scalar hiding (which does not exist on a unified OoO core).
+		if (timing_enabled_ && timing_model_ &&
+		    current_opId_ != Operation::OpId::NUMBER_OF_OPERATIONS &&
+		    xs_timing::isVectorOp(current_opId_)) {
+
+			xs_timing::XsFU fu = xs_timing::classifyFU(current_opId_);
+
+			// vsetvl* is configuration handled by the scalar core (default 1 cyc).
+			if (fu != xs_timing::XsFU::VSETVL) {
+				// ---- Build the instruction descriptor from runtime CSR state ----
+				xs_timing::XsVecInsn desc;
+				desc.fu = fu;
+				desc.vl = (uint32_t)iss.csrs.vl.reg.val;
+				desc.sew = 1u << (iss.csrs.vtype.reg.fields.vsew + 3);
+				desc.is_fp = is_fp;
+
+				uint32_t vlmul_field = iss.csrs.vtype.reg.fields.vlmul;
+				if (vlmul_field <= 3) {
+					desc.lmul_num = 1u << vlmul_field;  // 1,2,4,8
+					desc.lmul_den = 1;
+				} else if (vlmul_field >= 5) {
+					desc.lmul_num = 1;                  // fractional 1/8,1/4,1/2
+					desc.lmul_den = 1u << (8 - vlmul_field);
+				}
+
+				// Memory ops carry their EEW in the encoding (VLE32 => 32b), not SEW.
+				uint32_t mem_eew = xs_timing::getMemEEW(current_opId_);
+				if (mem_eew > 0) {
+					desc.sew = mem_eew;
+				}
+
+				// Strided ops: byte stride comes from rs2.
+				if (fu == xs_timing::XsFU::VLSU_STRIDED_LD ||
+				    fu == xs_timing::XsFU::VLSU_STRIDED_ST) {
+					desc.stride = iss.regs[iss.instr.rs2()];
+				}
+				// Indexed ops: index EEW == SEW suffix from encoding.
+				if (fu == xs_timing::XsFU::VLSU_GATHER ||
+				    fu == xs_timing::XsFU::VLSU_SCATTER) {
+					desc.sew_idx = mem_eew;
+				}
+
+				// ---- Compute the (source-ready-now) execution latency ----
+				xs_timing::XsInstLatency lat = timing_model_->computeCycles(desc);
+				uint64_t exec_cycles = lat.total_cycles;
+
+				// ---- Register scoreboard: RAW/WAW hazard stalls (Profile B) ----
+				// Determine the source/destination vector registers and their LMUL
+				// span, then stall (positive only) until sources are ready.
+				uint32_t opc = iss.instr.opcode();
+				uint32_t f3 = iss.instr.funct3();
+				uint32_t vd = iss.instr.rd();
+				uint32_t vs1 = iss.instr.rs1();
+				uint32_t vs2 = iss.instr.rs2();
+				bool masked = !iss.instr.vm();
+
+				// On the OPV opcode (0x57), rs1 is a vector reg only for the
+				// vector-vector forms (funct3 == OPIVV/OPFVV/OPMVV = 0/1/2).
+				bool rs1_is_vec = (opc == 0x57) && (f3 == 0 || f3 == 1 || f3 == 2);
+				// rs2 is a vector reg for OPV forms and for indexed mem ops.
+				bool rs2_is_vec = (opc == 0x57) ||
+				                  (fu == xs_timing::XsFU::VLSU_GATHER) ||
+				                  (fu == xs_timing::XsFU::VLSU_SCATTER);
+
+				uint32_t span = lmulSpan(vlmul_field);
+
+				uint64_t now = nowCycle();
+				uint64_t start = now;  // earliest issue time given hazards
+
+				// RAW on vs1 / vs2 (account for LMUL register clustering).
+				if (rs1_is_vec) {
+					for (uint32_t k = 0; k < span && (vs1 + k) < NUM_REGS; ++k)
+						start = std::max(start, vreg_ready_cycle_[vs1 + k]);
+				}
+				if (rs2_is_vec) {
+					for (uint32_t k = 0; k < span && (vs2 + k) < NUM_REGS; ++k)
+						start = std::max(start, vreg_ready_cycle_[vs2 + k]);
+				}
+				// Mask source v0 (RAW on the mask register).
+				if (masked) {
+					start = std::max(start, vreg_ready_cycle_[0]);
+				}
+				// WAW on the destination group (do not clobber an in-flight write).
+				for (uint32_t k = 0; k < span && (vd + k) < NUM_REGS; ++k)
+					start = std::max(start, vreg_ready_cycle_[vd + k]);
+
+				// The hazard stall the scalar core actually observes.
+				uint64_t hazard_stall = (start > now) ? (start - now) : 0;
+
+				// Total visible cost = hazard stall + synchronous issue latency.
+				// Independent instructions incur only issue_latency_ here and thus
+				// OVERLAP; dependent ones additionally pay hazard_stall.
+				uint64_t inject = hazard_stall + issue_latency_;
+				if (inject > 0) {
+					iss.xs_inject_cycles(inject);   // POSITIVE injection only
+				}
+
+
+				// After injecting issue latency the core clock has advanced; the
+				// destination becomes ready exec_cycles later (from issue point).
+				uint64_t issue_cycle = start + issue_latency_;
+				uint64_t done = issue_cycle + exec_cycles;
+				for (uint32_t k = 0; k < span && (vd + k) < NUM_REGS; ++k)
+					vreg_ready_cycle_[vd + k] = done;
+			}
+		}
+
+		current_opId_ = Operation::OpId::NUMBER_OF_OPERATIONS;
 	}
 
 	xlen_reg_t getIntVSew() {
