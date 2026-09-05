@@ -352,23 +352,23 @@ class XsTimingModel {
 				break;
 			}
 
-			// ---- Strided memory (math model §5.7, LOW anchor, stride explicit) ----
-			// L = numOfUop_strided*(C_flow + P_line(stride)) + C_wb; envelope [6.84,9.44].
+			// ---- Strided memory (decoupled VLSU; latency-band, not numUop-scaled) ----
 			case XsFU::VLSU_STRIDED_LD:
 			case XsFU::VLSU_STRIDED_ST: {
-				out.total_cycles = stridedLatency(desc);
-				out.n_beats = out.total_cycles;
+				out.total_cycles = stridedLatency(desc);          // use latency (flat-ish)
+				out.n_beats = (uint64_t)numOfUopArith(desc) * cfg_.c_strided_flow; // occupancy
 				break;
 			}
 
-			// ---- Indexed gather/scatter (math model §5.7, LOW anchor 11.30) ----
+			// ---- Indexed gather/scatter (decoupled VLSU; latency-band) ----
 			case XsFU::VLSU_GATHER:
 			case XsFU::VLSU_SCATTER: {
-				uint32_t nuop = numOfUopArith(desc);  // indexedLSTable+1 ~ per-group
-				uint64_t per_idx = cfg_.c_gather_rt_x10;  // x10
-				out.total_cycles = ((uint64_t)nuop * per_idx) / 10u;
-				if (out.total_cycles == 0) out.total_cycles = per_idx / 10u;
-				out.n_beats = out.total_cycles;
+				// Consumer-visible latency is a use-latency band (~c_gather_rt), NOT
+				// numUop * per-idx (that is occupancy). Decoupled gather engine overlaps
+				// the per-index walk; RTL vgather ~11 cyc regardless of small LMUL.
+				out.total_cycles = cfg_.c_gather_rt_x10 / 10u;
+				if (out.total_cycles == 0) out.total_cycles = 1;
+				out.n_beats = ((uint64_t)numOfUopArith(desc) * cfg_.c_gather_rt_x10) / 10u; // occupancy
 				break;
 			}
 
@@ -412,21 +412,27 @@ class XsTimingModel {
 	 * envelope [6.84, 9.44]. Modeled algebraically:
 	 *   P_line = clamp(p_line_max >> log2(stride/elem_bytes), 1, p_line_max)
 	 */
+	// Strided VLSU dependent-chain LATENCY (decoupled memory pipeline).
+	// XSTop's VLSplit/VSSplit + merge buffers hide most per-uop/per-line cost, so the
+	// consumer-visible latency is a use-latency band, only WEAKLY stride-dependent
+	// (RTL vlse_stride8..1024 ~= 6.8..9.4 cyc, near-flat) — NOT numUop-scaled and NOT
+	// steeply stride-scaled. Model as: base use latency + small stride adder; occupancy
+	// (n_beats) still carries the uop count for FU-busy accounting.
 	uint64_t stridedLatency(const XsVecInsn& desc) const {
-		uint32_t nuop = numOfUopArith(desc);  // stridedLSTable(emul,nf)+2 approximated by group
-		if (nuop == 0) nuop = 1;
 		uint32_t elem_bytes = (desc.sew ? desc.sew : 32) / 8u;
 		if (elem_bytes == 0) elem_bytes = 1;
-		// stride in units of elements (bytes / elem_bytes); larger stride -> fewer
-		// lines per uop -> smaller P_line.
 		uint64_t stride_elems = desc.stride / elem_bytes;
-		uint32_t shift = 0;
-		for (uint64_t s = stride_elems; s > 1; s >>= 1) ++shift;
-		uint32_t p_line = cfg_.p_line_max;
-		if (shift < 32) p_line = cfg_.p_line_max >> shift;
-		if (p_line < 1) p_line = 1;
-		uint64_t L = (uint64_t)nuop * (cfg_.c_strided_flow + p_line) + cfg_.c_strided_wb;
-		return L;
+		// base use latency = unit-stride L1-hit path (W_m + T_L1hit); add a small,
+		// saturating stride term (0..p_line_max) — larger stride -> at most +p_line_max,
+		// matching the RTL's shallow, bounded strided band (decoupled units cap it).
+		uint64_t base = (uint64_t)cfg_.w_m + cfg_.t_l1hit + cfg_.c_strided_flow;
+		uint32_t stride_add = 0;
+		if (stride_elems > 1) {
+			// grows slowly (log) and saturates at p_line_max; NOT linear in stride
+			for (uint64_t s = stride_elems; s > 1 && stride_add < cfg_.p_line_max; s >>= 1)
+				++stride_add;
+		}
+		return base + stride_add + cfg_.c_strided_wb;
 	}
 };
 
