@@ -360,15 +360,30 @@ class VExtension {
 				vector_issue_queue_.pop_front();
 			}
 
-			// If issue queue is full, scalar core must stall
-			if (vector_issue_queue_.size() >= MAX_VIQ_DEPTH) {
-				uint64_t oldest_retire_time = vector_issue_queue_.front();
-				if (now_ps < oldest_retire_time) {
-					uint64_t stall_ps = oldest_retire_time - now_ps;
-					iss.dbbcache.add_cycle_counter_raw(stall_ps);
-				}
-				vector_issue_queue_.pop_front();
-			}
+			// FIX 2026-09: this used to be the ONLY place a vector hazard's
+			// computed wait ever became a real injected cycle -- and only
+			// AFTER the 4-deep queue filled, catching the real clock up to
+			// the 4th-oldest instruction's START time (not even its
+			// completion). That leaves the first ~4 instructions of any
+			// dependent chain effectively free (no queue overflow yet, so
+			// no catch-up fires for them at all), a FIXED, one-time
+			// discount that showed up as different percentage errors on
+			// probes with the same real per-instruction cost purely
+			// because they had different total iteration counts. Confirmed
+			// via scoreboard tracing on two probes with an identical
+			// steady-state cost (144 cyc/instr, matched exactly): a
+			// 32-iteration probe lost 715 cycles to this discount, a
+			// 16-iteration probe lost 707 -- nearly the same ABSOLUTE
+			// amount despite very different totals, the signature of a
+			// fixed startup cost, not a per-iteration or access-pattern
+			// effect. Hazard stalls are now injected directly per
+			// instruction in finishInstr() (see hazard_stall below),
+			// starting from the very first one, so this queue no longer
+			// needs to inject anything itself -- doing so now would
+			// double-count the same wait. The queue's bookkeeping (clean-up
+			// above) is kept only in case a future, genuinely separate
+			// structural dispatch-width limit needs it; MAX_VIQ_DEPTH is
+			// not consulted here anymore.
 		}
 
 		if (require_not_off) {
@@ -561,6 +576,28 @@ class VExtension {
 					// WAW hazards
 					if (start_time_ps < reg_ready_time_ps_[rd]) start_time_ps = reg_ready_time_ps_[rd];
 
+					// FIX 2026-09: inject this instruction's real hazard-driven
+					// wait directly, into the real clock, right here -- for
+					// EVERY vector instruction, starting from the very first
+					// one. Previously the only path that ever turned a
+					// computed hazard into a real cycle was the issue queue's
+					// depth-4 overflow check in prepInstr(), which only
+					// engages once 4 vector instructions are already
+					// in-flight -- leaving the first ~4 instructions of any
+					// dependent chain effectively free. For a genuinely
+					// independent instruction (no RAW/WAW/structural hazard),
+					// start_time_ps == now_ps here and this injects 0,
+					// preserving the free overlap those already-validated
+					// probes rely on; only real, hazard-driven waits inject
+					// anything.
+					if (start_time_ps > now_ps) {
+						uint64_t hazard_stall_ps = start_time_ps - now_ps;
+						uint64_t hazard_stall_cycles = hazard_stall_ps / period_ps;
+						if (hazard_stall_cycles > 0) {
+							iss.ara_inject_cycles(hazard_stall_cycles);
+						}
+					}
+
 					// Update scoreboard
 					// FIX 2026-09: fu_ready_time_ps_ (structural FU-occupancy, gates
 					// back-to-back reissue of the SAME fu_idx) used n_beats (the
@@ -568,18 +605,34 @@ class VExtension {
 					// for ALU/FPU, where independent-register throughput is genuinely
 					// much cheaper than dependent-chain latency (confirmed via a real
 					// independent-vfmul.vv RTL probe: ~5.2 cyc/instr throughput vs
-					// ~28-31 cyc/instr dependent-chain latency) -- but WRONG for LSU,
+					// ~28-31 cyc/instr dependent-chain latency) -- but WRONG for stores,
 					// where n_beats alone drastically under-covers the real per-access
-					// structural cost. Confirmed via three real-RTL probes at the same
-					// vl=128/LMUL=8/SEW=64 point: independent-register loads (pure
-					// occupancy, no hazard) measured 113.75 cyc/instr, same-register
-					// reused loads 138.1, address-streaming loads 136.1 -- all close
-					// to the FULL total_cycles (142, from computeUnitLoad's fixed
-					// dispatch cost + beats), while n_beats alone (64) was less than
-					// half that. Real LSU cannot pipeline a new request in behind an
-					// outstanding one the way a deeply-pipelined FPU can. Use the full
-					// latency (`cycles`) as the occupancy window for LSU specifically.
-					uint64_t occupancy_cycles = (fu_idx == 2 || fu_idx == 3) ? cycles : n_beats;
+					// structural cost (stores have near-zero fixed dispatch cost, so
+					// `cycles` ~= real occupancy there). Loads need their own formula --
+					// see below.
+					//
+					// FIX 2026-09 (regression found once per-instruction injection above
+					// made this term actually matter): the above holds for stores (fixed
+					// dispatch cost is ~1 cycle, so cycles ~= real occupancy) but NOT for
+					// loads. Re-measured independent-register unit-stride loads directly
+					// on real RTL (ubench_mem_throughput, 2L/1024V, e64/m8, n_beats in
+					// {8,16,32,64}): per-instruction throughput is exactly
+					// 1.75*(n_beats+1) cycles (16.25, 29.75, 57.75, 113.75) -- well under
+					// the full completion latency `cycles` (14+2*n_beats -> 142 at
+					// n_beats=64), because a following independent load's request can
+					// issue while the current one is still waiting on its own response
+					// data; only the streaming/beat portion truly blocks the LSU.
+					// `cycles` itself remains unchanged for reg_ready_time_ps_/
+					// reg_first_element_ready_ps_, which model a real dependent consumer
+					// that must wait for the full round trip.
+					uint64_t occupancy_cycles;
+					if (fu_idx == 2) {
+						occupancy_cycles = (7 * (n_beats + 1) + 2) / 4;
+					} else if (fu_idx == 3) {
+						occupancy_cycles = cycles;
+					} else {
+						occupancy_cycles = n_beats;
+					}
 					fu_ready_time_ps_[fu_idx] = start_time_ps + (occupancy_cycles * period_ps);
 					reg_first_element_ready_ps_[rd] = start_time_ps + (l_fe * period_ps);
 					reg_ready_time_ps_[rd] = start_time_ps + (cycles * period_ps);
