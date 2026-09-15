@@ -63,9 +63,11 @@ class VExtension {
 				return 2; // LSU
 			case ara_timing::AraFU::VMFPU_MUL:
 			case ara_timing::AraFU::VMFPU_FMA:
+			case ara_timing::AraFU::VMFPU_FADD:
 			case ara_timing::AraFU::VMFPU_FNONCOMP:
 			case ara_timing::AraFU::VMFPU_FCONV:
 			case ara_timing::AraFU::VMFPU_FDIV:
+			case ara_timing::AraFU::VMFPU_FSQRT:
 				return 1; // FPU
 			default:
 				return 0; // ALU
@@ -482,7 +484,14 @@ class VExtension {
 				ara_timing::AraInstLatency latency = timing_model_->computeCycles(desc);
 				uint64_t cycles = latency.total_cycles;
 				uint64_t n_beats = latency.n_beats;
-				uint64_t l_fe = cycles > n_beats ? cycles - n_beats : 1;
+				
+				// Fix 1: Chaining latency should be the hardware latency (lat_fp/lat_alu), not total_cycles - n_beats.
+				// This allows the front-end (c_fe_fpu) to overlap between dependent instructions.
+				uint64_t hw_lat = 1;
+				if (fu >= ara_timing::AraFU::VMFPU_MUL && fu <= ara_timing::AraFU::VMFPU_FCONV) {
+					hw_lat = timing_model_->getLatFP(desc.sew);
+				}
+				uint64_t l_fe = hw_lat;
 
 				if (scalar_hiding_enabled_) {
 					uint64_t now_ps = iss.dbbcache.get_cycle_counter_raw();
@@ -493,14 +502,20 @@ class VExtension {
 					uint32_t rs2 = iss.instr.rs2();
 					bool masked = !iss.instr.vm();
 
+					// Fix 2: Only check RAW hazards for actual vector registers, avoid scalar register collisions
+					uint32_t opc = iss.instr.opcode();
+					uint32_t f3 = iss.instr.funct3();
+					bool rs1_is_vec = (opc == 0x57) && (f3 == 0 || f3 == 1 || f3 == 2);
+					bool rs2_is_vec = (opc == 0x57) || (fu == ara_timing::AraFU::VLSU_GATHER) || (fu == ara_timing::AraFU::VLSU_SCATTER);
+
 					uint64_t start_time_ps = now_ps;
 					// Structural hazard
 					int fu_idx = get_fu_index(fu);
 					if (start_time_ps < fu_ready_time_ps_[fu_idx]) start_time_ps = fu_ready_time_ps_[fu_idx];
 
 					// Data hazards (RAW)
-					if (start_time_ps < reg_first_element_ready_ps_[rs1]) start_time_ps = reg_first_element_ready_ps_[rs1];
-					if (start_time_ps < reg_first_element_ready_ps_[rs2]) start_time_ps = reg_first_element_ready_ps_[rs2];
+					if (rs1_is_vec && start_time_ps < reg_first_element_ready_ps_[rs1]) start_time_ps = reg_first_element_ready_ps_[rs1];
+					if (rs2_is_vec && start_time_ps < reg_first_element_ready_ps_[rs2]) start_time_ps = reg_first_element_ready_ps_[rs2];
 					if (masked && start_time_ps < reg_first_element_ready_ps_[0]) start_time_ps = reg_first_element_ready_ps_[0];
 					
 					// WAW hazards
@@ -511,8 +526,9 @@ class VExtension {
 					reg_first_element_ready_ps_[rd] = start_time_ps + (l_fe * period_ps);
 					reg_ready_time_ps_[rd] = start_time_ps + (cycles * period_ps);
 
-					// Push the completion time into the issue queue
-					vector_issue_queue_.push_back(reg_ready_time_ps_[rd]);
+					// Push the issue time (start of execution) into the issue queue, not completion time.
+					// This allows the scalar core to run ahead (decoupled), but bounds it to 4 unissued instructions.
+					vector_issue_queue_.push_back(start_time_ps);
 
 					// Sync scalar core to vector issue queue if ARI queue is full (simplified: scalar core is completely decoupled unless syncing)
 					// We only update vector_time_ps_ for scalar syncs (e.g. fence)
@@ -1932,7 +1948,11 @@ class VExtension {
 
 			double lmul = getVlmul();
 
-			xlen_reg_t vlmax = lmul * VLEN / getIntVSew();
+			unsigned effective_vlen_local = VLEN;
+			if (timing_enabled_ && timing_model_) {
+				effective_vlen_local = timing_model_->getConfig().vlen;
+			}
+			xlen_reg_t vlmax = lmul * effective_vlen_local / getIntVSew();
 			bool is_zero = (index + offset) >= vlmax || offset & ((uint64_t)1 << 63);
 
 			op_reg_t res = is_zero ? 0 : getSewSingleOperand(getIntVSew(), iss.instr.rs2(), index + offset, false);
@@ -1988,7 +2008,11 @@ class VExtension {
 
 			double lmul = getVlmul();
 
-			xlen_reg_t vlmax = lmul * VLEN / getIntVSew();
+			unsigned effective_vlen_local = VLEN;
+			if (timing_enabled_ && timing_model_) {
+				effective_vlen_local = timing_model_->getConfig().vlen;
+			}
+			xlen_reg_t vlmax = lmul * effective_vlen_local / getIntVSew();
 			uint64_t rs1_value = param_sel == param_sel_t::vx ? iss_reg_read(iss.instr.rs1()) : op1;
 			if (rs1_value >= vlmax) {
 				return 0;

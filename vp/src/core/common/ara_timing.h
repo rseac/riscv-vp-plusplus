@@ -21,10 +21,36 @@ namespace ara_timing {
 enum class AraFU : uint8_t {
 	VALU,          // Integer ALU (vadd, vsub, vand, vor, etc.)
 	VMFPU_MUL,    // Integer multiply (vmul, vmulh, vsmul)
-	VMFPU_FMA,    // FP arithmetic (vfadd, vfmul, vfmacc, etc.)
+	VMFPU_FMA,    // FP fused multiply-add/sub (vfmacc, vfmadd, vfmsac, vfnmacc,
+	              // etc.) - reads its own destination as a third operand for
+	              // accumulation, unlike VMFPU_FADD below.
+	VMFPU_FADD,   // FP simple 2-operand arithmetic (vfadd, vfsub, vfrsub,
+	              // vfmul) - split out from VMFPU_FMA 2026-09: jacobi2d's
+	              // real dependent chain (vfadd.vv x4 -> vfmul.vf, a 5-point
+	              // stencil sum+scale, confirmed via objdump) measured
+	              // ~9.2 cycles/instr (EW32) / ~10.1 (EW64) on real AraXL
+	              // RTL via a matching dependent chain -- roughly 1/3 of
+	              // VMFPU_FMA's ~28-31 cycles/instr, which was calibrated
+	              // from a vfmul->vfmacc->vfsub chain. Lumping these under
+	              // one constant overestimated every simple-add-dominated
+	              // benchmark (jacobi2d, somier's vfsub/vfadd portions) by
+	              // ~3x on their dependent-chain instructions. The 3-operand
+	              // fused ops (reading their own destination) appear to have
+	              // genuinely higher real latency than plain 2-operand ones,
+	              // consistent with an extra register-file read port/cycle
+	              // for the accumulator operand (not yet independently
+	              // confirmed in the RTL structurally -- flagged as
+	              // curve-fit-derived, not structurally-derived, per the
+	              // rtl_calibrator opcode-uniformity discipline).
 	VMFPU_FNONCOMP, // FP non-computational (vfmin, vfmax, vfsgnj, etc.)
 	VMFPU_FCONV,  // FP conversion (vfcvt*, vfwcvt*, vfncvt*)
-	VMFPU_FDIV,   // FP div/sqrt
+	VMFPU_FDIV,   // FP divide (vfdiv, vfrdiv) - real division, NOT sqrt
+	VMFPU_FSQRT,  // FP sqrt (vfsqrt) - split out 2026-09: on AraXL RTL,
+	              // measured cost is actually similar to FDIV (~6-7
+	              // cycles/instr for both), unlike Ara where sqrt was ~4x
+	              // more expensive than divide - kept as its own category
+	              // for consistency with Ara's model and because the two
+	              // costs are independently calibrated, not assumed equal.
 	VMFPU_IDIV,   // Integer division (vdiv, vdivu, vrem, vremu)
 	VLSU_UNIT_LD, // Unit-stride load
 	VLSU_UNIT_ST, // Unit-stride store
@@ -104,6 +130,7 @@ struct AraInstLatency {
  */
 class AraTimingModel {
    public:
+	uint32_t getLatFP(uint32_t sew) const;
 	explicit AraTimingModel(const AraConfig& cfg);
 
 	/*
@@ -168,7 +195,6 @@ class AraTimingModel {
 	// --- Helper methods ---
 	uint32_t computeNBeats(uint32_t vl, uint32_t sew) const;
 	uint32_t getLatMul(uint32_t sew) const;
-	uint32_t getLatFP(uint32_t sew) const;
 	uint32_t getALUFloor() const;
 	uint32_t getALUFrontEnd() const;
 	double getGatherPerElem() const;
@@ -177,9 +203,12 @@ class AraTimingModel {
 	uint64_t computeALU(const AraVecInsn& desc) const;
 	uint64_t computeMUL(const AraVecInsn& desc) const;
 	uint64_t computeFPFMA(const AraVecInsn& desc) const;
+	uint64_t computeFPAdd(const AraVecInsn& desc) const;
 	uint64_t computeFPNonComp(const AraVecInsn& desc) const;
 	uint64_t computeFPConv(const AraVecInsn& desc) const;
 	uint64_t computeIDIV(const AraVecInsn& desc) const;
+	uint64_t computeFPDiv(const AraVecInsn& desc) const;
+	uint64_t computeFPSqrt(const AraVecInsn& desc) const;
 	uint64_t computeUnitLoad(const AraVecInsn& desc) const;
 	uint64_t computeUnitStore(const AraVecInsn& desc) const;
 	uint64_t computeStridedLoad(const AraVecInsn& desc) const;
@@ -195,6 +224,21 @@ class AraTimingModel {
 	// RTL calibration values per (NrLanes, VLEN) configuration
 	uint32_t rtl_fpu_ew32_vl16_, rtl_fpu_ew32_vl256_, rtl_fpu_ew32_vl1024_;
 	uint32_t rtl_fpu_ew64_vl16_, rtl_fpu_ew64_vl256_, rtl_fpu_ew64_vl1024_;
+	// VMFPU_FADD dependent-chain constants (see AraFU::VMFPU_FADD comment).
+	// Measured via ubench_fpu_addchain_ew32/64 on real 4L/2C RTL: flat
+	// ~9.1-9.3 cycles/instr (EW32) and ~10.1 cycles/instr (EW64) at
+	// vl<=VLMAX across VLEN 2048 (only config measured so far -- not yet
+	// swept across vl buckets or other VLEN/lane configs the way the FMA
+	// constants above were, so the same value is used for all three
+	// buckets pending further calibration).
+	uint32_t rtl_fadd_ew32_vl16_, rtl_fadd_ew32_vl256_, rtl_fadd_ew32_vl1024_;
+	uint32_t rtl_fadd_ew64_vl16_, rtl_fadd_ew64_vl256_, rtl_fadd_ew64_vl1024_;
+	// Independent-register FMA-class throughput (FU-occupancy side of the
+	// latency/occupancy split -- see computeCycles). Measured via
+	// ubench_fpu_indep_ew32/64 on real 4L/2C RTL: flat ~5.2 cycles/instr
+	// across VLEN 1024/2048/4096 at realistic (<=VLMAX) vl, vs. the
+	// ~28-31 cycles/instr the dependent-chain constants above measure.
+	uint32_t rtl_fma_indep_beats_;
 	uint32_t rtl_valu_add_m1_vl16_, rtl_valu_add_m1_vl256_, rtl_valu_add_m1_vl1024_;
 	uint32_t rtl_valu_add_m2_vl16_, rtl_valu_add_m2_vl256_, rtl_valu_add_m2_vl1024_;
 	uint32_t rtl_valu_add_m8_vl16_, rtl_valu_add_m8_vl256_;

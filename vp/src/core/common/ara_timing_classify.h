@@ -293,7 +293,9 @@ inline AraFU classifyFU(Operation::OpId opId) {
 		case Operation::OpId::VREM_VX:
 			return AraFU::VMFPU_IDIV;
 
-		// --- FP Arithmetic (FMA path) ---
+		// --- FP simple 2-operand arithmetic (no destination read) ---
+		// Split from the fused-FMA path 2026-09: measured genuinely
+		// cheaper on real AraXL RTL (see AraFU::VMFPU_FADD).
 		case Operation::OpId::VFADD_VV:
 		case Operation::OpId::VFADD_VF:
 		case Operation::OpId::VFSUB_VV:
@@ -301,6 +303,21 @@ inline AraFU classifyFU(Operation::OpId opId) {
 		case Operation::OpId::VFRSUB_VF:
 		case Operation::OpId::VFMUL_VV:
 		case Operation::OpId::VFMUL_VF:
+		// Widening 2-operand FP
+		case Operation::OpId::VFWADD_VV:
+		case Operation::OpId::VFWADD_VF:
+		case Operation::OpId::VFWSUB_VV:
+		case Operation::OpId::VFWSUB_VF:
+		case Operation::OpId::VFWADD_WV:
+		case Operation::OpId::VFWADD_WF:
+		case Operation::OpId::VFWSUB_WV:
+		case Operation::OpId::VFWSUB_WF:
+		case Operation::OpId::VFWMUL_VV:
+		case Operation::OpId::VFWMUL_VF:
+			return AraFU::VMFPU_FADD;
+
+		// --- FP fused multiply-add/sub (reads its own destination as a
+		// third operand for accumulation) ---
 		case Operation::OpId::VFMACC_VV:
 		case Operation::OpId::VFMACC_VF:
 		case Operation::OpId::VFNMACC_VV:
@@ -317,17 +334,7 @@ inline AraFU classifyFU(Operation::OpId opId) {
 		case Operation::OpId::VFMSUB_VF:
 		case Operation::OpId::VFNMSUB_VV:
 		case Operation::OpId::VFNMSUB_VF:
-		// Widening FP
-		case Operation::OpId::VFWADD_VV:
-		case Operation::OpId::VFWADD_VF:
-		case Operation::OpId::VFWSUB_VV:
-		case Operation::OpId::VFWSUB_VF:
-		case Operation::OpId::VFWADD_WV:
-		case Operation::OpId::VFWADD_WF:
-		case Operation::OpId::VFWSUB_WV:
-		case Operation::OpId::VFWSUB_WF:
-		case Operation::OpId::VFWMUL_VV:
-		case Operation::OpId::VFWMUL_VF:
+		// Widening fused FP
 		case Operation::OpId::VFWMACC_VV:
 		case Operation::OpId::VFWMACC_VF:
 		case Operation::OpId::VFWNMACC_VV:
@@ -338,14 +345,21 @@ inline AraFU classifyFU(Operation::OpId opId) {
 		case Operation::OpId::VFWNMSAC_VF:
 			return AraFU::VMFPU_FMA;
 
-		// --- FP Div/Sqrt ---
+		// --- FP Divide (real division - see VMFPU_FSQRT below for sqrt,
+		// split out 2026-09) ---
 		case Operation::OpId::VFDIV_VV:
 		case Operation::OpId::VFDIV_VF:
 		case Operation::OpId::VFRDIV_VF:
-		case Operation::OpId::VFSQRT_V:
+		// VFRSQRT7_V/VFREC7_V are single-pass reciprocal ESTIMATE ops,
+		// architecturally distinct from full division/sqrt - left here
+		// uncalibrated (no RTL data yet) rather than guessed.
 		case Operation::OpId::VFRSQRT7_V:
 		case Operation::OpId::VFREC7_V:
 			return AraFU::VMFPU_FDIV;
+
+		// --- FP Sqrt ---
+		case Operation::OpId::VFSQRT_V:
+			return AraFU::VMFPU_FSQRT;
 
 		// --- FP Non-computational ---
 		case Operation::OpId::VFMIN_VV:
