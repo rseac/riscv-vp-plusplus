@@ -14,8 +14,133 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
 
 namespace ara_timing {
+
+// ============================================================================
+// VPPP_TIMING_DEBUG instrumentation: accumulates, per FU class, the total
+// "cycles" (full latency, includes tau_mem/floor/etc.) vs "n_beats" (pure
+// throughput/FU-occupancy component) returned by computeCycles(), so we can
+// see empirically how much of a benchmark's total predicted time comes from
+// fixed per-instruction latency terms (like tau_mem) vs streaming throughput.
+// Enabled only when the VPPP_TIMING_DEBUG env var is set; zero overhead/
+// behavior change otherwise. Dumped to stderr at process exit.
+// ============================================================================
+namespace {
+struct FuClassStats {
+	uint64_t count = 0;
+	uint64_t sum_total_cycles = 0;
+	uint64_t sum_n_beats = 0;
+	uint64_t lookup_hit_count = 0;
+	uint64_t lookup_hit_cycles = 0;
+};
+// vl-bucket histogram, specifically for VMFPU_FMA (the bucket the lookupRTL
+// table keys on: <=16, <=256, <=1024, >1024), split by whether lmul_num==1
+// (lookupRTL's exact-match condition) so we can see whether a benchmark's
+// FMA traffic is even eligible for the lookup table at all, and if so which
+// bucket it lands in - vl256_/vl1024_ are still uncalibrated guesses.
+struct FmaVlHisto {
+	uint64_t count[4] = {0, 0, 0, 0};       // lmul==1 eligible
+	uint64_t count_other_lmul[4] = {0, 0, 0, 0}; // lmul!=1, never hits lookupRTL
+	uint64_t cycles[4] = {0, 0, 0, 0};
+};
+struct DebugStats {
+	bool enabled = false;
+	FuClassStats by_class[4]; // 0=ALU, 1=FPU, 2=LSU, 3=OTHER
+	FuClassStats by_fu[23];   // fine-grained, indexed by (uint8_t)AraFU
+	FmaVlHisto fma_histo;
+	DebugStats() { enabled = (std::getenv("VPPP_TIMING_DEBUG") != nullptr); }
+	~DebugStats() {
+		if (!enabled) return;
+		static const char* fu_names[23] = {
+			"VALU", "VMFPU_MUL", "VMFPU_FMA", "VMFPU_FNONCOMP", "VMFPU_FCONV",
+			"VMFPU_FDIV", "VMFPU_FSQRT", "VMFPU_IDIV", "VLSU_UNIT_LD", "VLSU_UNIT_ST",
+			"VLSU_STRIDED_LD", "VLSU_STRIDED_ST", "VLSU_GATHER", "VLSU_SCATTER",
+			"VREDU_INT", "VREDU_FP", "VSLIDE", "VNARROW", "VMASK", "VMV",
+			"VSETVL", "VWHOLE_REG", "UNKNOWN"
+		};
+		fprintf(stderr, "\n[VPPP_TIMING_DEBUG] Fine-grained per-AraFU breakdown:\n");
+		for (int i = 0; i < 23; i++) {
+			const auto& s = by_fu[i];
+			if (s.count == 0) continue;
+			fprintf(stderr,
+			        "  %-16s count=%8llu  sum_total_cycles=%10llu  avg=%8.2f  lookupRTL_hits=%8llu\n",
+			        fu_names[i], (unsigned long long)s.count, (unsigned long long)s.sum_total_cycles,
+			        (double)s.sum_total_cycles / (double)s.count, (unsigned long long)s.lookup_hit_count);
+		}
+		static const char* names[4] = {"ALU", "FPU", "LSU", "OTHER"};
+		fprintf(stderr, "\n[VPPP_TIMING_DEBUG] Per-FU-class accumulated cost breakdown:\n");
+		uint64_t grand_total = 0, grand_beats = 0;
+		for (int i = 0; i < 4; i++) {
+			const auto& s = by_class[i];
+			grand_total += s.sum_total_cycles;
+			grand_beats += s.sum_n_beats;
+			fprintf(stderr,
+			        "  %-6s count=%8llu  sum_total_cycles=%10llu  sum_n_beats=%10llu  "
+			        "latency_overhead(total-beats)=%10llu  lookupRTL_hits=%8llu(%10llu cyc)\n",
+			        names[i], (unsigned long long)s.count,
+			        (unsigned long long)s.sum_total_cycles, (unsigned long long)s.sum_n_beats,
+			        (unsigned long long)(s.sum_total_cycles - s.sum_n_beats),
+			        (unsigned long long)s.lookup_hit_count, (unsigned long long)s.lookup_hit_cycles);
+		}
+		fprintf(stderr, "  %-6s count=%8s  sum_total_cycles=%10llu  sum_n_beats=%10llu  "
+		        "latency_overhead(total-beats)=%10llu\n",
+		        "TOTAL", "-", (unsigned long long)grand_total, (unsigned long long)grand_beats,
+		        (unsigned long long)(grand_total - grand_beats));
+
+		static const char* buckets[4] = {"vl<=16", "vl<=256", "vl<=1024", "vl>1024"};
+		fprintf(stderr, "[VPPP_TIMING_DEBUG] VMFPU_FMA vl-bucket histogram:\n");
+		for (int i = 0; i < 4; i++) {
+			fprintf(stderr,
+			        "  %-9s lmul1_count=%8llu  cycles=%10llu  other_lmul_count=%8llu\n",
+			        buckets[i], (unsigned long long)fma_histo.count[i],
+			        (unsigned long long)fma_histo.cycles[i],
+			        (unsigned long long)fma_histo.count_other_lmul[i]);
+		}
+	}
+};
+DebugStats g_debug_stats;
+
+int fmaVlBucket(uint32_t vl) {
+	if (vl <= 16) return 0;
+	if (vl <= 256) return 1;
+	if (vl <= 1024) return 2;
+	return 3;
+}
+
+int fuClassIndex(AraFU fu) {
+	switch (fu) {
+		case AraFU::VLSU_UNIT_LD:
+		case AraFU::VLSU_UNIT_ST:
+		case AraFU::VLSU_STRIDED_LD:
+		case AraFU::VLSU_STRIDED_ST:
+		case AraFU::VLSU_GATHER:
+		case AraFU::VLSU_SCATTER:
+		case AraFU::VWHOLE_REG:
+			return 2; // LSU
+		case AraFU::VMFPU_MUL:
+		case AraFU::VMFPU_FMA:
+		case AraFU::VMFPU_FNONCOMP:
+		case AraFU::VMFPU_FCONV:
+		case AraFU::VMFPU_FDIV:
+		case AraFU::VMFPU_FSQRT:
+			return 1; // FPU
+		case AraFU::VALU:
+		case AraFU::VMFPU_IDIV:
+		case AraFU::VREDU_INT:
+		case AraFU::VREDU_FP:
+		case AraFU::VSLIDE:
+		case AraFU::VMASK:
+		case AraFU::VNARROW:
+		case AraFU::VMV:
+			return 0; // ALU
+		default:
+			return 3; // OTHER
+	}
+}
+} // namespace
 
 static uint32_t ilog2_ceil(uint32_t x) {
 	if (x <= 1) return 0;
@@ -53,22 +178,28 @@ AraTimingModel::AraTimingModel(const AraConfig& cfg) : cfg_(cfg) {
 	uint32_t lane_offset = (nl >= 4) ? 4 : 0;
 	
 	// FPU EW32 — RTL calibration data
-	// VL16: 2L=12, 4L=28(anomaly at 4L/8192=12), 8L=28
-	if (nl == 2) { rtl_fpu_ew32_vl16_ = 12; }
-	else if (nl == 4) { rtl_fpu_ew32_vl16_ = (vl >= 8192) ? 12 : 28; }
-	else { rtl_fpu_ew32_vl16_ = 28; }
-	
+	// Recalibrated 2026-09 against a real dependent mul->madd->sub RTL sweep
+	// (benchmark_suite/ara/apps/ubench_fpu_chain_hazards, SEW32/LMUL1,
+	// vl<=16, all 9 lane/VLEN configs). The previous "2L=12, >=4L=28" jump
+	// was NOT present in real RTL: a fully dependent FMA chain is
+	// latency-bound (each op waits for the last), so lane count - which adds
+	// data-parallel width, not per-op latency - has no measurable effect.
+	// Measured per-instruction cost was flat at ~9.0-9.6 cycles across every
+	// lane count and VLEN tested (mean 9.05); replacing the previous
+	// nl/vlen-branchy guess with that flat value fixes the ~2x ROI
+	// overestimate this caused for FMA-chain-heavy kernels (e.g.
+	// blackscholes) at >=4 lanes. vl256_/vl1024_ buckets are untouched -
+	// no calibration data for those yet.
+	rtl_fpu_ew32_vl16_ = 9;
+
 	rtl_fpu_ew32_vl256_ = (nl == 2) ? 25 : 29;
 	rtl_fpu_ew32_vl1024_ = (nl == 2) ? 26 : 30;
-	
-	// FPU EW64
-	if (nl == 2) { rtl_fpu_ew64_vl16_ = 13; }
-	else if (nl == 4) { rtl_fpu_ew64_vl16_ = (vl >= 4096) ? 13 : 20; }
-	else { // 8L
-		if (vl >= 8192) rtl_fpu_ew64_vl16_ = 13;
-		else if (vl >= 4096) rtl_fpu_ew64_vl16_ = 20;
-		else rtl_fpu_ew64_vl16_ = 26;
-	}
+
+	// FPU EW64 — same recalibration, same sweep (SEW64/LMUL1, vl<=16).
+	// Measured per-instruction cost flat at ~9.1-11.4 cycles across every
+	// lane count/VLEN (mean 10.48), replacing the previous "2L=13, 4L=13-20,
+	// 8L=13-26" branchy guess.
+	rtl_fpu_ew64_vl16_ = 10;
 	rtl_fpu_ew64_vl256_ = (nl == 2) ? 24 : 28;
 	rtl_fpu_ew64_vl1024_ = (nl == 2) ? 25 : 29;
 	
@@ -263,6 +394,39 @@ uint64_t AraTimingModel::computeIDIV(const AraVecInsn& desc) const {
 }
 
 // ============================================================================
+// FP Divide (VFDIV, VFRDIV) - real hardware divider, NOT integer division
+//
+// Calibrated 2026-09 against ubench_fdiv_chain_hazards (dependent vfdiv.vv
+// chain, SEW32/64, LMUL1, RTL sweep across all 9 lane/VLEN configs). Cost
+// was flat ~7 (SEW32) / ~9 (SEW64) cycles/instruction across every lane
+// count and VLEN tested - like the FMA chain, a fully dependent divide
+// chain is latency-bound, not lane-width-bound, so lanes don't help it.
+// Previously this FU was routed through computeIDIV's serial-integer-
+// divider formula (273-537 cycles/instr for real benchmarks doing FP
+// division, e.g. somier/swaptions) - a ~30-60x overestimate.
+// ============================================================================
+uint64_t AraTimingModel::computeFPDiv(const AraVecInsn& desc) const {
+	return (desc.sew == 64) ? 9 : 7;
+}
+
+// ============================================================================
+// FP Sqrt (VFSQRT)
+//
+// Calibrated 2026-09 against ubench_fdiv_chain_hazards (dependent
+// vfsqrt.v chain). SEW32 behaves like division (~7 cycles/instr, flat
+// across lanes/VLEN). SEW64 is markedly more expensive (16-56
+// cycles/instr) and, unusually among everything calibrated so far, DOES
+// vary with lane count and VLEN - real double-precision sqrt is not fully
+// pipelined the same way division is. We use the mean (34) as a flat
+// approximation for now; this is a known-imprecise placeholder pending a
+// dedicated lane/VLEN-resolved sqrt sweep, but is still a large
+// improvement over the previous serial-integer-divider formula.
+// ============================================================================
+uint64_t AraTimingModel::computeFPSqrt(const AraVecInsn& desc) const {
+	return (desc.sew == 64) ? 34 : 7;
+}
+
+// ============================================================================
 // Equation #10: Vector Load - Unit Stride (VLE)
 // HIGH confidence
 //
@@ -270,7 +434,12 @@ uint64_t AraTimingModel::computeIDIV(const AraVecInsn& desc) const {
 // ============================================================================
 uint64_t AraTimingModel::computeUnitLoad(const AraVecInsn& desc) const {
 	uint32_t n_beats = computeNBeats(desc.vl, desc.sew);
-	return 2 * log2_nr_clusters_ + 11 + cfg_.tau_mem + n_beats;
+	// Recalibrated 2026-09 against real Ara RTL (ubench_mem_hazards sweep,
+	// benchmark_suite/ara/apps/ubench_mem_hazards): replaces the guessed
+	// "11 + tau_mem(=10)" fixed cost with the measured ~14 cycles/instruction,
+	// and doubles the per-beat cost - real sustained bandwidth is ~half of
+	// the ideal 64-bits/lane/cycle this formula previously assumed.
+	return 2 * log2_nr_clusters_ + 14 + 2 * n_beats;
 }
 
 // ============================================================================
@@ -281,7 +450,11 @@ uint64_t AraTimingModel::computeUnitLoad(const AraVecInsn& desc) const {
 // ============================================================================
 uint64_t AraTimingModel::computeUnitStore(const AraVecInsn& desc) const {
 	uint32_t n_beats = computeNBeats(desc.vl, desc.sew);
-	return 2 * log2_nr_clusters_ + 8 + cfg_.tau_mem + n_beats;
+	// Recalibrated 2026-09: stores have near-zero fixed dispatch cost in RTL
+	// (no destination register/response to wait on), vs the previous
+	// "8 + tau_mem(=10)" guess. Beat cost doubled for the same reason as
+	// computeUnitLoad.
+	return 2 * log2_nr_clusters_ + 1 + 2 * n_beats;
 }
 
 // ============================================================================
@@ -393,8 +566,29 @@ uint64_t AraTimingModel::computeNarrow(const AraVecInsn& desc) const {
 // ============================================================================
 // Mask operations (VMAND, VMOR, VCPOP, VFIRST, etc.)
 // Use ALU model as baseline — mask ops go through similar pipeline
+//
+// FIX 2026-09: this flat ALU-baseline formula was never independently
+// calibrated, and real Ara RTL (masku.sv) structurally contradicts it for
+// the "scan-class" subset (vcpop, vfirst, viota, vid, vmsbf, vmsif, vmsof):
+// these are explicitly time-multiplexed in hardware --
+//   // Execution time example for vcpop.m (similar for vfirst.m):
+//   // t_vcpop.m = VLEN/VcpopParallelism
+//   localparam int VcpopParallelism = 16;
+// -- a real, documented multi-cycle mechanism, not a parallel elementwise
+// op. Confirmed via an isolated RTL probe reproducing particlefilter's
+// actual compare->cpop->first->iota chain (the dominant driver of its
+// VMASK cost): a compare-only variant matched RTL almost exactly (-1.6%),
+// but the full chain including the 3 scan ops underestimated by -33%,
+// isolating the entire gap to this scan-class formula. The simple
+// bitwise mask-logic ops (vmand/vmor/etc.) are NOT part of masku.sv's
+// time-multiplexing scheme and keep the original ALU-baseline formula.
 // ============================================================================
 uint64_t AraTimingModel::computeMask(const AraVecInsn& desc) const {
+	if (desc.is_mask_scan) {
+		uint32_t parallelism = cfg_.mask_scan_parallelism ? cfg_.mask_scan_parallelism : 16;
+		uint32_t slice_cycles = (desc.vl + parallelism - 1) / parallelism;  // ceil(vl / parallelism)
+		return cfg_.mask_scan_fixed + slice_cycles;
+	}
 	// Mask ops process 1 bit per element, but still beat-based
 	// Use SEW=8 for beat computation (1 element per byte per lane)
 	uint32_t n_beats = computeNBeats(desc.vl, 8);
@@ -500,7 +694,32 @@ AraInstLatency AraTimingModel::computeCycles(const AraVecInsn& desc) const {
 	
 	// Try RTL lookup first for exact calibration
 	uint64_t rtl_val = lookupRTL(desc);
-	if (rtl_val > 0) return {rtl_val, rtl_val};
+	if (rtl_val > 0) {
+		if (g_debug_stats.enabled) {
+			int idx = fuClassIndex(desc.fu);
+			auto& s = g_debug_stats.by_class[idx];
+			s.count++;
+			s.sum_total_cycles += rtl_val;
+			s.sum_n_beats += rtl_val; // lookup hits are treated as fully-exposed, no latency/throughput split
+			s.lookup_hit_count++;
+			s.lookup_hit_cycles += rtl_val;
+			auto& fs = g_debug_stats.by_fu[(int)(uint8_t)desc.fu];
+			fs.count++;
+			fs.sum_total_cycles += rtl_val;
+			fs.lookup_hit_count++;
+			if (desc.fu == AraFU::VMFPU_FMA && desc.lmul_num == 1 && desc.lmul_den == 1) {
+				int b = fmaVlBucket(desc.vl);
+				g_debug_stats.fma_histo.count[b]++;
+				g_debug_stats.fma_histo.cycles[b] += rtl_val;
+			}
+		}
+		return {rtl_val, rtl_val};
+	}
+	if (g_debug_stats.enabled && desc.fu == AraFU::VMFPU_FMA &&
+	    !(desc.lmul_num == 1 && desc.lmul_den == 1)) {
+		int b = fmaVlBucket(desc.vl);
+		g_debug_stats.fma_histo.count_other_lmul[b]++;
+	}
 
 	switch (desc.fu) {
 		case AraFU::VALU:
@@ -519,10 +738,21 @@ AraInstLatency AraTimingModel::computeCycles(const AraVecInsn& desc) const {
 			total = computeFPConv(desc); break;
 
 		case AraFU::VMFPU_FDIV:
-			// Use FP pipeline + serial divider approximation
-			total = computeIDIV(desc); break;
+			// Recalibrated 2026-09 (ubench_fdiv_chain_hazards): real FP
+			// division has a dedicated pipelined unit, NOT the serial
+			// bit-by-bit integer divider this used to reuse via computeIDIV
+			// (which was costing 273-537 cycles/instr for real benchmarks
+			// like somier/swaptions that do genuine FP division).
+			total = computeFPDiv(desc); break;
+
+		case AraFU::VMFPU_FSQRT:
+			// Split out from VMFPU_FDIV 2026-09 - real sqrt costs ~4x
+			// division's cost in RTL (see computeFPSqrt).
+			total = computeFPSqrt(desc); break;
 
 		case AraFU::VMFPU_IDIV:
+			// Untouched: genuine integer division/remainder - no RTL data
+			// yet suggesting this serial-divider model is wrong for it.
 			total = computeIDIV(desc); break;
 
 		case AraFU::VLSU_UNIT_LD:
@@ -581,13 +811,33 @@ AraInstLatency AraTimingModel::computeCycles(const AraVecInsn& desc) const {
 	
 	if (desc.fu == AraFU::VLSU_GATHER || desc.fu == AraFU::VLSU_SCATTER ||
 	    desc.fu == AraFU::VLSU_STRIDED_LD || desc.fu == AraFU::VLSU_STRIDED_ST ||
-	    desc.fu == AraFU::VMFPU_FDIV || desc.fu == AraFU::VMFPU_IDIV) {
+	    desc.fu == AraFU::VMFPU_FDIV || desc.fu == AraFU::VMFPU_FSQRT || desc.fu == AraFU::VMFPU_IDIV ||
+	    (desc.fu == AraFU::VMASK && desc.is_mask_scan)) {
+		// Mask scan-class ops (vcpop/vfirst/viota/...) are non-pipelined,
+		// time-multiplexed hardware (masku.sv) -- same reasoning as the
+		// LSU/FDIV/IDIV cases above: the generic n_beats formula below is
+		// unrelated to this formula's real cost and would leave the
+		// computeMask() fix invisible to the occupancy-driven scoreboard
+		// (confirmed: fixing total_cycles alone left the probe's observed
+		// ROI completely unchanged, since ALU-class occupancy reads
+		// n_beats, not total_cycles).
 		result.n_beats = total;
 	} else {
 		uint32_t n = desc.vl > 0 ? (desc.vl * desc.sew + (cfg_.nr_lanes * 64) - 1) / (cfg_.nr_lanes * 64) : 0;
 		result.n_beats = n > 0 ? n : 1;
 	}
-	
+
+	if (g_debug_stats.enabled) {
+		auto& s = g_debug_stats.by_class[fuClassIndex(desc.fu)];
+		s.count++;
+		s.sum_total_cycles += result.total_cycles;
+		s.sum_n_beats += result.n_beats;
+		auto& fs = g_debug_stats.by_fu[(int)(uint8_t)desc.fu];
+		fs.count++;
+		fs.sum_total_cycles += result.total_cycles;
+		fs.sum_n_beats += result.n_beats;
+	}
+
 	return result;
 }
 

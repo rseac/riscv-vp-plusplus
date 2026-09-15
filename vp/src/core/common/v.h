@@ -46,7 +46,7 @@ class VExtension {
 	// --- AraXL Timing Model Scoreboard ---
 	uint64_t reg_ready_time_ps_[32] = {0};
 	uint64_t reg_first_element_ready_ps_[32] = {0};
-	uint64_t fu_ready_time_ps_[3] = {0}; // 0: ALU, 1: FPU, 2: LSU
+	uint64_t fu_ready_time_ps_[4] = {0}; // 0: ALU, 1: FPU, 2: LSU loads, 3: LSU stores
 
 	// Vector Issue Queue for structural scalar stalls
 	std::deque<uint64_t> vector_issue_queue_;
@@ -54,18 +54,30 @@ class VExtension {
 
 	int get_fu_index(ara_timing::AraFU fu) {
 		switch (fu) {
+			// FIX 2026-09: loads and stores used to share ONE occupancy bucket
+			// (index 2). That was fine while occupancy used bare n_beats (small
+			// enough that it was never the binding constraint), but once LSU
+			// occupancy was corrected to use the full latency (see
+			// fu_ready_time_ps_ update below), a store now had to wait out the
+			// PRECEDING LOAD's entire occupancy window just because they shared
+			// one bucket -- confirmed via ubench_fma_lmul8 (load,load,FMA,store
+			// per iteration): flipped from -19.5% to +13.5%, an over-
+			// serialization regression. Split into separate load/store buckets,
+			// matching a real vector LSU's independent load and store queues.
 			case ara_timing::AraFU::VLSU_UNIT_LD:
-			case ara_timing::AraFU::VLSU_UNIT_ST:
 			case ara_timing::AraFU::VLSU_STRIDED_LD:
-			case ara_timing::AraFU::VLSU_STRIDED_ST:
 			case ara_timing::AraFU::VLSU_GATHER:
+				return 2; // LSU loads
+			case ara_timing::AraFU::VLSU_UNIT_ST:
+			case ara_timing::AraFU::VLSU_STRIDED_ST:
 			case ara_timing::AraFU::VLSU_SCATTER:
-				return 2; // LSU
+				return 3; // LSU stores
 			case ara_timing::AraFU::VMFPU_MUL:
 			case ara_timing::AraFU::VMFPU_FMA:
 			case ara_timing::AraFU::VMFPU_FNONCOMP:
 			case ara_timing::AraFU::VMFPU_FCONV:
 			case ara_timing::AraFU::VMFPU_FDIV:
+			case ara_timing::AraFU::VMFPU_FSQRT:
 				return 1; // FPU
 			default:
 				return 0; // ALU
@@ -425,6 +437,18 @@ class VExtension {
 				desc.stride = 0;
 				desc.sew_idx = 0;
 				desc.is_widening = false;
+				// Mask "scan-class" ops (vcpop/vfirst/viota/vid/vmsbf/vmsif/
+				// vmsof) are real-RTL time-multiplexed (masku.sv) -- distinct
+				// from the simple bitwise mask-logic ops (vmand/vmor/etc.)
+				// that share the same AraFU::VMASK classification. See
+				// computeMask()'s scan-class branch.
+				desc.is_mask_scan = (current_opId_ == Operation::OpId::VCPOP_M ||
+				                     current_opId_ == Operation::OpId::VFIRST_M ||
+				                     current_opId_ == Operation::OpId::VIOTA_M ||
+				                     current_opId_ == Operation::OpId::VID_V ||
+				                     current_opId_ == Operation::OpId::VMSBF_M ||
+				                     current_opId_ == Operation::OpId::VMSIF_M ||
+				                     current_opId_ == Operation::OpId::VMSOF_M);
 
 				// Decode LMUL from vtype
 				uint32_t vlmul_field = iss.csrs.vtype.reg.fields.vlmul;
@@ -475,7 +499,39 @@ class VExtension {
 				ara_timing::AraInstLatency latency = timing_model_->computeCycles(desc);
 				uint64_t cycles = latency.total_cycles;
 				uint64_t n_beats = latency.n_beats;
-				uint64_t l_fe = cycles > n_beats ? cycles - n_beats : 1;
+				
+				// Fix 1: Chaining latency should be the hardware latency (lat_fp/lat_alu), not total_cycles - n_beats.
+				// This allows the front-end (c_fe_fpu) to overlap between dependent instructions.
+				uint64_t hw_lat = 1;
+				if (fu >= ara_timing::AraFU::VMFPU_MUL && fu <= ara_timing::AraFU::VMFPU_FCONV) {
+					hw_lat = timing_model_->getLatFP(desc.sew);
+				}
+				// FIX 2026-09: l_fe=1 (chaining: a dependent op may start reading
+				// this result just 1 cycle after THIS op's own issue) was applied
+				// to every non-FPU category, including VLSU and VSLIDE. That's a
+				// real vector-chaining assumption for simple ALU-class producers,
+				// but a load's data plainly cannot be forwarded to a consumer 1
+				// cycle after the load merely issues -- real memory access takes
+				// the load's full latency. Confirmed via an isolated RTL probe
+				// reproducing pathfinder's exact chain (vle32->vslide1up->vmin->
+				// vslide1down->vmin->vle32->vadd->vse32, LMUL=8/SEW=32): real RTL
+				// measured 71740 cycles vs VP++'s 48915 (-31.8%), matching
+				// pathfinder's own real -37.5% error. VLSU and VSLIDE (a
+				// register-shuffle op, not a simple elementwise ALU op) do not
+				// get the same fast-chaining treatment; only genuinely
+				// elementwise categories (VALU, VMASK, VNARROW, reductions) keep
+				// l_fe=1 pending their own RTL verification.
+				bool is_slow_chain = (fu == ara_timing::AraFU::VLSU_UNIT_LD ||
+				                      fu == ara_timing::AraFU::VLSU_UNIT_ST ||
+				                      fu == ara_timing::AraFU::VLSU_STRIDED_LD ||
+				                      fu == ara_timing::AraFU::VLSU_STRIDED_ST ||
+				                      fu == ara_timing::AraFU::VLSU_GATHER ||
+				                      fu == ara_timing::AraFU::VLSU_SCATTER ||
+				                      fu == ara_timing::AraFU::VSLIDE);
+				if (is_slow_chain) {
+					hw_lat = cycles;
+				}
+				uint64_t l_fe = hw_lat;
 
 				if (scalar_hiding_enabled_) {
 					uint64_t now_ps = iss.dbbcache.get_cycle_counter_raw();
@@ -486,26 +542,51 @@ class VExtension {
 					uint32_t rs2 = iss.instr.rs2();
 					bool masked = !iss.instr.vm();
 
+					// Fix 2: Only check RAW hazards for actual vector registers, avoid scalar register collisions
+					uint32_t opc = iss.instr.opcode();
+					uint32_t f3 = iss.instr.funct3();
+					bool rs1_is_vec = (opc == 0x57) && (f3 == 0 || f3 == 1 || f3 == 2);
+					bool rs2_is_vec = (opc == 0x57) || (fu == ara_timing::AraFU::VLSU_GATHER) || (fu == ara_timing::AraFU::VLSU_SCATTER);
+
 					uint64_t start_time_ps = now_ps;
 					// Structural hazard
 					int fu_idx = get_fu_index(fu);
 					if (start_time_ps < fu_ready_time_ps_[fu_idx]) start_time_ps = fu_ready_time_ps_[fu_idx];
 
 					// Data hazards (RAW)
-					if (start_time_ps < reg_first_element_ready_ps_[rs1]) start_time_ps = reg_first_element_ready_ps_[rs1];
-					if (start_time_ps < reg_first_element_ready_ps_[rs2]) start_time_ps = reg_first_element_ready_ps_[rs2];
+					if (rs1_is_vec && start_time_ps < reg_first_element_ready_ps_[rs1]) start_time_ps = reg_first_element_ready_ps_[rs1];
+					if (rs2_is_vec && start_time_ps < reg_first_element_ready_ps_[rs2]) start_time_ps = reg_first_element_ready_ps_[rs2];
 					if (masked && start_time_ps < reg_first_element_ready_ps_[0]) start_time_ps = reg_first_element_ready_ps_[0];
 					
 					// WAW hazards
 					if (start_time_ps < reg_ready_time_ps_[rd]) start_time_ps = reg_ready_time_ps_[rd];
 
 					// Update scoreboard
-					fu_ready_time_ps_[fu_idx] = start_time_ps + (n_beats * period_ps);
+					// FIX 2026-09: fu_ready_time_ps_ (structural FU-occupancy, gates
+					// back-to-back reissue of the SAME fu_idx) used n_beats (the
+					// throughput-only component) for every FU category. That's correct
+					// for ALU/FPU, where independent-register throughput is genuinely
+					// much cheaper than dependent-chain latency (confirmed via a real
+					// independent-vfmul.vv RTL probe: ~5.2 cyc/instr throughput vs
+					// ~28-31 cyc/instr dependent-chain latency) -- but WRONG for LSU,
+					// where n_beats alone drastically under-covers the real per-access
+					// structural cost. Confirmed via three real-RTL probes at the same
+					// vl=128/LMUL=8/SEW=64 point: independent-register loads (pure
+					// occupancy, no hazard) measured 113.75 cyc/instr, same-register
+					// reused loads 138.1, address-streaming loads 136.1 -- all close
+					// to the FULL total_cycles (142, from computeUnitLoad's fixed
+					// dispatch cost + beats), while n_beats alone (64) was less than
+					// half that. Real LSU cannot pipeline a new request in behind an
+					// outstanding one the way a deeply-pipelined FPU can. Use the full
+					// latency (`cycles`) as the occupancy window for LSU specifically.
+					uint64_t occupancy_cycles = (fu_idx == 2 || fu_idx == 3) ? cycles : n_beats;
+					fu_ready_time_ps_[fu_idx] = start_time_ps + (occupancy_cycles * period_ps);
 					reg_first_element_ready_ps_[rd] = start_time_ps + (l_fe * period_ps);
 					reg_ready_time_ps_[rd] = start_time_ps + (cycles * period_ps);
 
-					// Push the completion time into the issue queue
-					vector_issue_queue_.push_back(reg_ready_time_ps_[rd]);
+					// Push the issue time (start of execution) into the issue queue, not completion time.
+					// This allows the scalar core to run ahead (decoupled), but bounds it to 4 unissued instructions.
+					vector_issue_queue_.push_back(start_time_ps);
 
 					// Sync scalar core to vector issue queue if ARI queue is full (simplified: scalar core is completely decoupled unless syncing)
 					// We only update vector_time_ps_ for scalar syncs (e.g. fence)
@@ -576,8 +657,11 @@ class VExtension {
 				avl = iss.csrs.vl.reg.val;
 			}
 		}
-		// VL strategy: always set to maximum allowed value
-		iss.csrs.vl.reg.val = avl <= vlmax ? avl : vlmax;
+		if (avl <= vlmax) {
+			iss.csrs.vl.reg.val = avl;
+		} else {
+			iss.csrs.vl.reg.val = vlmax;
+		}
 
 		/* write new value (incl. possible vill) */
 		iss.csrs.vtype.reg.val = vtype_new;
@@ -1925,7 +2009,11 @@ class VExtension {
 
 			double lmul = getVlmul();
 
-			xlen_reg_t vlmax = lmul * VLEN / getIntVSew();
+			unsigned effective_vlen_local = VLEN;
+			if (timing_enabled_ && timing_model_) {
+				effective_vlen_local = timing_model_->getConfig().vlen;
+			}
+			xlen_reg_t vlmax = lmul * effective_vlen_local / getIntVSew();
 			bool is_zero = (index + offset) >= vlmax || offset & ((uint64_t)1 << 63);
 
 			op_reg_t res = is_zero ? 0 : getSewSingleOperand(getIntVSew(), iss.instr.rs2(), index + offset, false);
@@ -1981,7 +2069,11 @@ class VExtension {
 
 			double lmul = getVlmul();
 
-			xlen_reg_t vlmax = lmul * VLEN / getIntVSew();
+			unsigned effective_vlen_local = VLEN;
+			if (timing_enabled_ && timing_model_) {
+				effective_vlen_local = timing_model_->getConfig().vlen;
+			}
+			xlen_reg_t vlmax = lmul * effective_vlen_local / getIntVSew();
 			uint64_t rs1_value = param_sel == param_sel_t::vx ? iss_reg_read(iss.instr.rs1()) : op1;
 			if (rs1_value >= vlmax) {
 				return 0;

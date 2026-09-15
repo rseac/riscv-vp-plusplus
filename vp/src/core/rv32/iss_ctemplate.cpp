@@ -905,6 +905,9 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				/* rd != x0/zero variants */
 				OP_CASE(FENCE) {
 					lscache.fence();
+#ifdef EXT_V_ENABLE
+					v_ext.syncVector();
+#endif
 				}
 				OP_END();
 

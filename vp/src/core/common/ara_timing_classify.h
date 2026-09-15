@@ -338,14 +338,21 @@ inline AraFU classifyFU(Operation::OpId opId) {
 		case Operation::OpId::VFWNMSAC_VF:
 			return AraFU::VMFPU_FMA;
 
-		// --- FP Div/Sqrt ---
+		// --- FP Divide (real division - see VMFPU_FSQRT below for sqrt,
+		// split out 2026-09 since RTL shows very different costs) ---
 		case Operation::OpId::VFDIV_VV:
 		case Operation::OpId::VFDIV_VF:
 		case Operation::OpId::VFRDIV_VF:
-		case Operation::OpId::VFSQRT_V:
+		// VFRSQRT7_V/VFREC7_V are single-pass reciprocal ESTIMATE ops (7-bit
+		// accuracy), architecturally distinct from full division/sqrt - left
+		// here uncalibrated (no RTL data yet) rather than guessed.
 		case Operation::OpId::VFRSQRT7_V:
 		case Operation::OpId::VFREC7_V:
 			return AraFU::VMFPU_FDIV;
+
+		// --- FP Sqrt ---
+		case Operation::OpId::VFSQRT_V:
+			return AraFU::VMFPU_FSQRT;
 
 		// --- FP Non-computational ---
 		case Operation::OpId::VFMIN_VV:

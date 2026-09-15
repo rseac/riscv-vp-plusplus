@@ -12,3 +12,8 @@ _start:
 .align 4
 .space 65536
 _sp:
+
+.globl hw_cnt_en_reg
+.align 3
+hw_cnt_en_reg:
+    .dword 0

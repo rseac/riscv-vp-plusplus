@@ -24,7 +24,13 @@ enum class AraFU : uint8_t {
 	VMFPU_FMA,    // FP arithmetic (vfadd, vfmul, vfmacc, etc.)
 	VMFPU_FNONCOMP, // FP non-computational (vfmin, vfmax, vfsgnj, etc.)
 	VMFPU_FCONV,  // FP conversion (vfcvt*, vfwcvt*, vfncvt*)
-	VMFPU_FDIV,   // FP div/sqrt
+	VMFPU_FDIV,   // FP divide (vfdiv, vfrdiv) - real division, NOT sqrt
+	VMFPU_FSQRT,  // FP sqrt (vfsqrt) - split out from VMFPU_FDIV 2026-09:
+	              // real RTL shows sqrt costs ~4x div's cost and, unlike
+	              // every other FU calibrated so far, genuinely varies with
+	              // lane/VLEN (see ubench_fdiv_chain_hazards data) - lumping
+	              // it with division under one flat constant was wrong in
+	              // both directions depending on a kernel's div:sqrt ratio.
 	VMFPU_IDIV,   // Integer division (vdiv, vdivu, vrem, vremu)
 	VLSU_UNIT_LD, // Unit-stride load
 	VLSU_UNIT_ST, // Unit-stride store
@@ -55,6 +61,12 @@ struct AraVecInsn {
 	uint64_t stride;   // For strided ops: stride value from rs2
 	uint32_t sew_idx;  // For gather/scatter: index EEW (8, 16, 32, 64)
 	bool is_widening;  // Widening operation
+	// True for vcpop/vfirst/viota/vid/vmsbf/vmsif/vmsof -- real Ara RTL
+	// (masku.sv) time-multiplexes these at a fixed bits/cycle Parallelism,
+	// fundamentally different from the simple parallel bitwise mask logic
+	// ops (vmand/vmor/etc.) that share the same AraFU::VMASK category.
+	// See computeMask()'s scan-class branch.
+	bool is_mask_scan;
 };
 
 /*
@@ -81,6 +93,22 @@ struct AraConfig {
 	uint32_t c_fe_fpu_ew32;  // FPU front-end overhead for EW32 (default: 8)
 	uint32_t c_fe_fpu_ew64;  // FPU front-end overhead for EW64 (default: 5)
 
+	// Mask-scan constants (vcpop/vfirst/viota/vid/vmsbf/vmsif/vmsof) -- 2026-09.
+	// Real Ara RTL (masku.sv) time-multiplexes these at mask_scan_parallelism
+	// bits/cycle (a real hardware localparam, confirmed at 16 in this
+	// project's masku.sv -- NOT the generic 64 used in masku.md's example),
+	// structurally distinct from the simple parallel bitwise mask-logic ops
+	// (vmand/vmor/etc.) that share the same AraFU::VMASK classification.
+	// mask_scan_fixed is the per-instruction dispatch/pipeline-fill overhead
+	// on top of the slice-processing time; calibrated against a real-RTL
+	// probe reproducing particlefilter's actual compare->cpop->first->iota
+	// chain (vl=32, e32, m1, 2 lanes): RTL measured ~13.4 cyc/instr average
+	// for the 3 scan ops combined, vs. the ceil(vl/16)=2 cycles the pure
+	// slice-processing term alone would give -- the gap is real dispatch
+	// overhead, not further slice-scaling.
+	uint32_t mask_scan_parallelism; // bits/cycle time-multiplexing (default: 16)
+	uint32_t mask_scan_fixed;       // per-instruction fixed overhead (default: 11)
+
 	AraConfig()
 	    : nr_lanes(2),
 	      nr_clusters(2),
@@ -91,7 +119,9 @@ struct AraConfig {
 	      c_per_elem_gather(3.0),
 	      c_startup_floor_gather(67),
 	      c_fe_fpu_ew32(8),
-	      c_fe_fpu_ew64(5) {}
+	      c_fe_fpu_ew64(5),
+	      mask_scan_parallelism(16),
+	      mask_scan_fixed(11) {}
 };
 
 struct AraInstLatency {
@@ -104,6 +134,7 @@ struct AraInstLatency {
  */
 class AraTimingModel {
    public:
+	uint32_t getLatFP(uint32_t sew) const;
 	explicit AraTimingModel(const AraConfig& cfg);
 
 	/*
@@ -168,7 +199,6 @@ class AraTimingModel {
 	// --- Helper methods ---
 	uint32_t computeNBeats(uint32_t vl, uint32_t sew) const;
 	uint32_t getLatMul(uint32_t sew) const;
-	uint32_t getLatFP(uint32_t sew) const;
 	uint32_t getALUFloor() const;
 	uint32_t getALUFrontEnd() const;
 	double getGatherPerElem() const;
@@ -180,6 +210,8 @@ class AraTimingModel {
 	uint64_t computeFPNonComp(const AraVecInsn& desc) const;
 	uint64_t computeFPConv(const AraVecInsn& desc) const;
 	uint64_t computeIDIV(const AraVecInsn& desc) const;
+	uint64_t computeFPDiv(const AraVecInsn& desc) const;
+	uint64_t computeFPSqrt(const AraVecInsn& desc) const;
 	uint64_t computeUnitLoad(const AraVecInsn& desc) const;
 	uint64_t computeUnitStore(const AraVecInsn& desc) const;
 	uint64_t computeStridedLoad(const AraVecInsn& desc) const;
