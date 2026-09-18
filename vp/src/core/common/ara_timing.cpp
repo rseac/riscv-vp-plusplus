@@ -493,13 +493,27 @@ uint64_t AraTimingModel::computeStridedStore(const AraVecInsn& desc) const {
 
 // ============================================================================
 // Equation #18: Gather / Indexed Load (VLUXEI, VLOXEI)
-// LOW confidence
+// RECALIBRATED 2026-09 (was LOW confidence) -- root-caused via spmv's
+// consistent ~40% overestimate across all 9 configs.
 //
-// T = C_harness + max(C_fixed + VL * C_per_elem(NL), C_startup_floor(NL))
+// T = C_harness + max(C_fixed + VL * C_per_elem, C_startup_floor)
 //
-// C_fixed = 15 (dispatch + operand delivery + sync + completion)
-// C_per_elem: 3.0 (2L), 2.7 (4L), 2.5 (8L) — tunable
-// C_startup_floor: 67 (2L), 61 (4L), 57 (8L) — tunable
+// Real Ara RTL (addrgen.sv): indexed-load address generation is a serial
+// state machine that consumes one element index per accepted cycle
+// regardless of NrLanes ("Ara stalls on an indexed memory operation",
+// addrgen.sv ~line 439) -- confirmed empirically via ubench_gather_isolated
+// (32 independent vluxei64.v, e64), which measured BYTE-IDENTICAL cycle
+// counts at 2/4/8 lanes (462/550/809/1321 @ vl=2/4/8/16). The previous
+// formula assumed lane-dependent per-elem/floor constants that were never
+// actually wired up per-lane in any of the project's config JSONs (every
+// config shipped the same flat 3.0/67 values) -- a structural assumption
+// that was simply wrong, not a mistuned constant. The 67-cycle floor also
+// never applies in practice: real per-instruction cost at vl=2 is ~14
+// cycles, not 63-73. Fit: ~9.16 + 2.0*vl per instruction at any lane count
+// (C_fixed=3 + c_harness=6 = 9, c_per_elem=2.0, floor=0/disabled).
+// computeScatter() shares this formula; no RiVEC benchmark exercises
+// scatter, so that side is untested by this fix, not just unaffected.
+// Validated so far only at VLEN=1024 -- flagged for a VLEN spot-check.
 // ============================================================================
 uint64_t AraTimingModel::computeGather(const AraVecInsn& desc) const {
 	double c_per_elem = getGatherPerElem();
@@ -695,12 +709,42 @@ AraInstLatency AraTimingModel::computeCycles(const AraVecInsn& desc) const {
 	// Try RTL lookup first for exact calibration
 	uint64_t rtl_val = lookupRTL(desc);
 	if (rtl_val > 0) {
+		// FIX 2026-09: lookupRTL() hits used to return {rtl_val, rtl_val} --
+		// the exact same conflation-of-latency-and-occupancy bug found and
+		// fixed for LSU loads (see v.h). rtl_val is a genuine dependent-CHAIN
+		// latency (measured from a fully-serial mul->madd->sub-style RTL
+		// probe), correct for total_cycles (gates a real dependent consumer),
+		// but wrong as the structural occupancy that gates back-to-back
+		// INDEPENDENT reissue of the same FU. Confirmed directly: lavamd's
+		// kernel_vec accumulates 4 independent vfmacc.vf destinations
+		// (xfA_v/x/y/z) per inner loop -- a real RTL probe of exactly that
+		// shape (SEW32/LMUL1/vl=32, 8 lanes) measured 3.64 cycles/instr
+		// back-to-back, not the 29-cycle chain latency the lookup table was
+		// also being charged as occupancy for (1024 such instances alone
+		// summed to 29,696 cycles -- already exceeding lavamd's entire
+		// RTL ground truth of 25,517).
+		//
+		// Plain n_beats alone (the occupancy the non-lookup path already
+		// uses) was tried first and UNDER-shoots: a dedicated independent-
+		// FMA RTL sweep (SEW32/LMUL1/vl=32, ubench_fma_lmul1_indep) across
+		// lane counts measured 8.08/4.63/3.78 cycles/instr at 2/4/8 lanes
+		// against n_beats of 8/4/2 -- a real, non-beat-proportional fixed
+		// per-instruction dispatch cost that plain n_beats misses entirely,
+		// and which dominates at small vl (blackscholes's CNDF chain, at
+		// vl=8, hits n_beats=1 -- an even more extreme case -- and using
+		// plain n_beats there regressed blackscholes from -unknown to
+		// -45%, confirming the same undershoot). Linear fit across the
+		// three lane counts: occupancy ~= 0.74*n_beats + 2.06; approximated
+		// here as n_beats + 2 for simplicity. Still a coarse, one-probe
+		// approximation -- flagged for follow-up recalibration with more
+		// data points, same as the AraXL sqrt SEW64 case.
+		uint32_t occ_n_beats = computeNBeats(desc.vl, desc.sew) + 2;
 		if (g_debug_stats.enabled) {
 			int idx = fuClassIndex(desc.fu);
 			auto& s = g_debug_stats.by_class[idx];
 			s.count++;
 			s.sum_total_cycles += rtl_val;
-			s.sum_n_beats += rtl_val; // lookup hits are treated as fully-exposed, no latency/throughput split
+			s.sum_n_beats += occ_n_beats;
 			s.lookup_hit_count++;
 			s.lookup_hit_cycles += rtl_val;
 			auto& fs = g_debug_stats.by_fu[(int)(uint8_t)desc.fu];
@@ -713,7 +757,7 @@ AraInstLatency AraTimingModel::computeCycles(const AraVecInsn& desc) const {
 				g_debug_stats.fma_histo.cycles[b] += rtl_val;
 			}
 		}
-		return {rtl_val, rtl_val};
+		return {rtl_val, occ_n_beats};
 	}
 	if (g_debug_stats.enabled && desc.fu == AraFU::VMFPU_FMA &&
 	    !(desc.lmul_num == 1 && desc.lmul_den == 1)) {
@@ -809,8 +853,30 @@ AraInstLatency AraTimingModel::computeCycles(const AraVecInsn& desc) const {
 	
 	result.total_cycles = total;
 	
-	if (desc.fu == AraFU::VLSU_GATHER || desc.fu == AraFU::VLSU_SCATTER ||
-	    desc.fu == AraFU::VLSU_STRIDED_LD || desc.fu == AraFU::VLSU_STRIDED_ST ||
+	if (desc.fu == AraFU::VLSU_STRIDED_LD) {
+		// FIX 2026-09: VLSU_STRIDED_LD used to share the "n_beats = total"
+		// bucket below with VLSU_GATHER, on the assumption both are
+		// equally non-pipelined. Found wrong while fixing gather (see
+		// c_per_elem_gather's comment): once gather's own occupancy bug
+		// was fixed by using `cycles` directly for fu_idx==2 non-unit-
+		// stride loads, lavamd (which uses strided, not gather, loads --
+		// _MM_LOAD_STRIDE_f32) regressed from -3.0% to -10.5%, because
+		// `cycles` (computeStridedLoad() ~= computeUnitLoad() + a small
+		// crossbar term, MEDIUM confidence) undershoots strided load's
+		// real structural occupancy. A dedicated independent-register RTL
+		// probe (ubench_strided_indep, e32/stride=16B, matching lavamd's
+		// real shape) measured BYTE-IDENTICAL cycle counts at 2/4/8 lanes
+		// (2359/4396/8492 @ vl=8/16/32) -- lane-independent, like gather,
+		// but with a much smaller fixed cost (simpler base+i*stride
+		// addressing vs. gather's per-element index extraction): fits
+		// ~2.46 + 2.0*vl per instruction, essentially gather's per-element
+		// slope with a near-zero intercept. Store this directly rather
+		// than reusing `total`, since latency and occupancy are genuinely
+		// different values here (unlike gather, where the whole operation
+		// is one serial unit and `cycles` already IS the right occupancy).
+		result.n_beats = 2 + 2 * desc.vl;
+	} else if (desc.fu == AraFU::VLSU_GATHER || desc.fu == AraFU::VLSU_SCATTER ||
+	    desc.fu == AraFU::VLSU_STRIDED_ST ||
 	    desc.fu == AraFU::VMFPU_FDIV || desc.fu == AraFU::VMFPU_FSQRT || desc.fu == AraFU::VMFPU_IDIV ||
 	    (desc.fu == AraFU::VMASK && desc.is_mask_scan)) {
 		// Mask scan-class ops (vcpop/vfirst/viota/...) are non-pipelined,
@@ -821,10 +887,38 @@ AraInstLatency AraTimingModel::computeCycles(const AraVecInsn& desc) const {
 		// (confirmed: fixing total_cycles alone left the probe's observed
 		// ROI completely unchanged, since ALU-class occupancy reads
 		// n_beats, not total_cycles).
+		// NOTE: VLSU_STRIDED_ST stays in this bucket (occupancy = cycles)
+		// -- untouched, since no RiVEC benchmark exercises strided stores
+		// and there is no RTL probe validating it either way.
 		result.n_beats = total;
 	} else {
 		uint32_t n = desc.vl > 0 ? (desc.vl * desc.sew + (cfg_.nr_lanes * 64) - 1) / (cfg_.nr_lanes * 64) : 0;
-		result.n_beats = n > 0 ? n : 1;
+		n = n > 0 ? n : 1;
+		if (desc.fu == AraFU::VMFPU_FNONCOMP) {
+			// FIX 2026-09: found while chasing a blackscholes regression
+			// caused by the lookupRTL occupancy fix above. FNONCOMP's
+			// occupancy was plain n_beats, same as every other non-special-
+			// cased category -- but a dedicated independent-register RTL
+			// probe (ubench_fnoncomp_indep, vfsgnjx.vv/e32/m1/vl=8, matching
+			// blackscholes's real abs()-via-sign-manipulation usage) measured
+			// 3.43/2.93/2.70 cycles/instr at 2/4/8 lanes against n_beats of
+			// 2/1/1 -- a real, fixed ~2-cycle front-end/dispatch cost on top
+			// of the streaming beats that plain n_beats misses, the same
+			// shape of gap already found and fixed for the LSU-load and
+			// lookupRTL-hit FMA/VALU occupancy terms. This category was
+			// masked before because the old, over-serialized FMA/VALU
+			// lookup occupancy (same fu_idx=1 slot) was already gating
+			// reissue more than FNONCOMP's own true cost required; fixing
+			// that exposed this pre-existing, separate under-count. Scoped
+			// to FNONCOMP only -- no RTL evidence yet that other FPU/ALU
+			// categories sharing the generic n_beats fallback need the same
+			// correction, and at least one (independent vfmacc.vf at
+			// LMUL=8, ubench_fma_lmul8) was already validated with plain
+			// n_beats, so this is deliberately not applied FU-class-wide.
+			result.n_beats = n + 2;
+		} else {
+			result.n_beats = n;
+		}
 	}
 
 	if (g_debug_stats.enabled) {

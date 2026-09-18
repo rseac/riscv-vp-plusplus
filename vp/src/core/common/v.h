@@ -625,10 +625,30 @@ class VExtension {
 					// `cycles` itself remains unchanged for reg_ready_time_ps_/
 					// reg_first_element_ready_ps_, which model a real dependent consumer
 					// that must wait for the full round trip.
+					// FIX 2026-09: the unit-stride occupancy fit above
+					// (7*(n_beats+1)+2)/4 was calibrated from raw beat
+					// counts (VLSU_UNIT_LD only). fu_idx==2 also covers
+					// VLSU_STRIDED_LD and VLSU_GATHER:
+					//  - VLSU_GATHER's `n_beats` field is deliberately set
+					//    to the FULL latency (`total`) elsewhere -- it's a
+					//    genuinely non-pipelined, serialized unit
+					//    (confirmed via addrgen.sv's per-element index-
+					//    generation state machine), so occupancy = cycles.
+					//  - VLSU_STRIDED_LD's `n_beats` field is instead set
+					//    to its OWN dedicated occupancy fit (2 + 2*vl,
+					//    RTL-measured via ubench_strided_indep) -- real
+					//    strided-load occupancy is lane-independent like
+					//    gather's, but NOT equal to its own latency
+					//    (`cycles` undershot it: found as a regression on
+					//    lavamd, -3.0% -> -10.5%, when strided load was
+					//    first lumped in with gather's cycles-direct
+					//    treatment). Use n_beats directly for it.
 					uint64_t occupancy_cycles;
-					if (fu_idx == 2) {
+					if (fu_idx == 2 && fu == ara_timing::AraFU::VLSU_UNIT_LD) {
 						occupancy_cycles = (7 * (n_beats + 1) + 2) / 4;
-					} else if (fu_idx == 3) {
+					} else if (fu_idx == 2 && fu == ara_timing::AraFU::VLSU_STRIDED_LD) {
+						occupancy_cycles = n_beats;
+					} else if (fu_idx == 2 || fu_idx == 3) {
 						occupancy_cycles = cycles;
 					} else {
 						occupancy_cycles = n_beats;
@@ -643,8 +663,9 @@ class VExtension {
 
 					// Sync scalar core to vector issue queue if ARI queue is full (simplified: scalar core is completely decoupled unless syncing)
 					// We only update vector_time_ps_ for scalar syncs (e.g. fence)
-					if (reg_ready_time_ps_[rd] > vector_time_ps_) {
-						vector_time_ps_ = reg_ready_time_ps_[rd];
+					uint64_t end_time_ps = start_time_ps + (cycles * period_ps);
+					if (end_time_ps > vector_time_ps_) {
+						vector_time_ps_ = end_time_ps;
 					}
 				} else {
 					// Fallback to sequential

@@ -86,8 +86,21 @@ struct AraConfig {
 
 	// Gather tunable: per-element cost and startup floor
 	// These are per-config and may be tuned by the calibrator
-	double c_per_elem_gather;    // Gather per-element cost (default: 3.0 for 2L)
-	uint32_t c_startup_floor_gather; // Gather startup floor (default: 67 for 2L)
+	//
+	// FIX 2026-09: recalibrated from a LOW-confidence, never-validated guess
+	// (3.0 per-elem, 67 floor, both assumed lane-dependent even though every
+	// project config JSON actually shipped the same flat values for every
+	// lane count) to a real RTL measurement. addrgen.sv's indexed-load state
+	// machine consumes one element index per accepted cycle regardless of
+	// NrLanes ("Ara stalls on an indexed memory operation" -- addrgen.sv
+	// line ~439); confirmed empirically via ubench_gather_isolated (32
+	// independent vluxei64.v, e64), which gave BYTE-IDENTICAL cycle counts
+	// at 2/4/8 lanes (462/550/809/1321 at vl=2/4/8/16). That data also
+	// showed the 67-cycle floor never actually applies in practice -- real
+	// per-instruction cost at vl=2 is ~14 cycles, not 63-73. See
+	// C_GATHER_FIXED below for the matching intercept term.
+	double c_per_elem_gather;    // Gather per-element cost (2.0, lane-independent)
+	uint32_t c_startup_floor_gather; // Gather startup floor (0 -- real RTL shows no floor)
 
 	// FPU front-end constants (tunable for calibration)
 	uint32_t c_fe_fpu_ew32;  // FPU front-end overhead for EW32 (default: 8)
@@ -116,8 +129,8 @@ struct AraConfig {
 	      elen(64),
 	      tau_mem(10),
 	      c_harness(6),
-	      c_per_elem_gather(3.0),
-	      c_startup_floor_gather(67),
+	      c_per_elem_gather(2.0),
+	      c_startup_floor_gather(0),
 	      c_fe_fpu_ew32(8),
 	      c_fe_fpu_ew64(5),
 	      mask_scan_parallelism(16),
@@ -190,8 +203,13 @@ class AraTimingModel {
 	// Strided interconnect floor
 	static constexpr uint32_t C_STRIDED_INTERCONNECT_FLOOR = 4;
 
-	// Gather fixed pipeline constant
-	static constexpr uint32_t C_GATHER_FIXED = 15;
+	// Gather fixed pipeline constant. FIX 2026-09: was 15 (LOW-confidence
+	// guess); real RTL (ubench_gather_isolated, see c_per_elem_gather's
+	// comment) fits total per-instruction cost of ~9.16 + 2.0*vl at ANY
+	// lane count. c_harness(6) is added separately in computeGather(), so
+	// this fixed term is 3 (3 + 6 harness = 9, matching the measured
+	// intercept), not 9 itself.
+	static constexpr uint32_t C_GATHER_FIXED = 3;
 
 	// VLSU sync FF chain
 	static constexpr uint32_t C_SYNC_VLSU = 3;

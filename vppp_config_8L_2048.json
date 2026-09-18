@@ -174,8 +174,8 @@
     "vppp.ISS.Core-0.ara_vlen": "2048",
     "vppp.ISS.Core-0.ara_tau_mem": "10",
     "vppp.ISS.Core-0.ara_c_harness": "6",
-    "vppp.ISS.Core-0.ara_c_per_elem_gather_x10": "30",
-    "vppp.ISS.Core-0.ara_c_startup_floor_gather": "67",
+    "vppp.ISS.Core-0.ara_c_per_elem_gather_x10": "20",
+    "vppp.ISS.Core-0.ara_c_startup_floor_gather": "0",
     "vppp.ISS.Core-0.ara_c_fe_fpu_ew32": "8",
     "vppp.ISS.Core-0.ara_c_fe_fpu_ew64": "5",
     "vppp.ISS.Core-0.ara_enable_scalar_hiding": "1"
