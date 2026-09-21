@@ -117,6 +117,40 @@ struct OpMapEntry {
 	void *labelPtr;
 };
 
+// VPPP_TIMING_DEBUG_OPCLASS: global (not function-local-static, which would
+// silently split across the multiple DBBCache template instantiations --
+// rv32/rv64/rv64_cheriv9 x Dummy/real -- and never print reliably) per-OpId
+// dynamic instruction count and total cost, gated by the same env var. Call
+// vppp_opclass_debug_dump() explicitly from a known-reliable exit point
+// (e.g. right next to "num-cycles (mcycle) = ..." in iss_ctemplate.cpp)
+// rather than relying on a static destructor, which was found NOT to fire
+// reliably for this specific instrumentation.
+struct VpppOpClassDebugGlobal {
+	bool enabled;
+	uint64_t counts[Operation::OpId::NUMBER_OF_OPERATIONS] = {0};
+	uint64_t total_ps[Operation::OpId::NUMBER_OF_OPERATIONS] = {0};
+	VpppOpClassDebugGlobal() : enabled(std::getenv("VPPP_TIMING_DEBUG_OPCLASS") != nullptr) {}
+};
+inline VpppOpClassDebugGlobal g_vppp_opclass_debug;
+
+inline void vppp_opclass_debug_record(Operation::OpId opId, uint64_t instr_time_ps) {
+	if (!g_vppp_opclass_debug.enabled) return;
+	g_vppp_opclass_debug.counts[opId]++;
+	g_vppp_opclass_debug.total_ps[opId] += instr_time_ps;
+}
+
+inline void vppp_opclass_debug_dump() {
+	if (!g_vppp_opclass_debug.enabled) return;
+	fprintf(stderr, "\n[VPPP_TIMING_DEBUG_OPCLASS] Per-OpId scalar instruction breakdown (nonzero only):\n");
+	for (unsigned i = 0; i < Operation::OpId::NUMBER_OF_OPERATIONS; i++) {
+		if (g_vppp_opclass_debug.counts[i] == 0) continue;
+		fprintf(stderr, "  %-16s count=%10llu  total_ps=%14llu  avg_ps=%9.2f\n",
+		        Operation::opIdStr[i], (unsigned long long)g_vppp_opclass_debug.counts[i],
+		        (unsigned long long)g_vppp_opclass_debug.total_ps[i],
+		        (double)g_vppp_opclass_debug.total_ps[i] / (double)g_vppp_opclass_debug.counts[i]);
+	}
+}
+
 /******************************************************************************
  * END: MISC
  ******************************************************************************/
@@ -289,6 +323,8 @@ class DBBCacheDummy_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if
 		this->mem_word = fetch_decode(pc, instr, opId);
 		this->pc = pc;
 		cycle_counter_raw += this->opMap[opId].instr_time;
+		vppp_opclass_debug_record(opId, this->opMap[opId].instr_time);
+
 		return this->opMap[opId].labelPtr;
 	}
 
@@ -1162,6 +1198,7 @@ class DBBCache_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if> {
 
 			/* update block cycle counter -> see comments in decode_update_entry above */
 			dummyBlock.entries[1].cycle_counter_raw += this->opMap[opId].instr_time;
+			vppp_opclass_debug_record(opId, this->opMap[opId].instr_time);
 
 			return this->opMap[opId].labelPtr;
 		}

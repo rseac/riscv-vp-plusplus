@@ -167,6 +167,16 @@ class VExtension {
 		scalar_hiding_enabled_ = enable_scalar_hiding;
 		timing_model_ = new ara_timing::AraTimingModel(cfg);
 		timing_enabled_ = true;
+		// Architectural vlenb must reflect the configured hardware VLEN, not the
+		// ISS storage width (VLEN constant above).
+		iss.csrs.vlenb.reg.val = effVlen() / 8;
+	}
+
+	// Hardware VLEN in bits as seen by software (whole-register ops, vlenb CSR).
+	unsigned effVlen() const {
+		if (timing_enabled_ && timing_model_)
+			return timing_model_->getConfig().vlen;
+		return VLEN;
 	}
 
 	~VExtension() {
@@ -663,7 +673,28 @@ class VExtension {
 
 					// Sync scalar core to vector issue queue if ARI queue is full (simplified: scalar core is completely decoupled unless syncing)
 					// We only update vector_time_ps_ for scalar syncs (e.g. fence)
-					uint64_t end_time_ps = start_time_ps + (cycles * period_ps);
+					//
+					// FIX 2026-09: this used `cycles` (the full dependent-chain
+					// LATENCY, same value used for reg_ready_time_ps_ -- correct
+					// there, for a genuinely dependent consumer) to advance
+					// vector_time_ps_, which is a DIFFERENT thing: how far the
+					// vector unit's dispatch/decoupling queue has progressed for
+					// scalar-sync purposes, not when this particular result is
+					// visible to a dependent consumer. For a benchmark issuing
+					// many independent vector ops back-to-back (unit-stride
+					// loads/stores dominate particlefilter and somier), each
+					// dispatch pushed vector_time_ps_ out by the full per-
+					// instruction latency (e.g. ~18-46 cyc for a unit-stride
+					// load) instead of the much smaller real occupancy advance
+					// (~4-32 cyc, RTL-measured), so interleaved scalar code
+					// hitting a sync point was forced to "catch up" to an
+					// artificially inflated vector-busy time that doesn't exist
+					// in real (pipelined) hardware -- a latency/occupancy
+					// conflation of the same class already fixed elsewhere in
+					// this file for FU-occupancy accounting, just missed here.
+					// Use occupancy_cycles (already computed above, same value
+					// used for fu_ready_time_ps_) instead.
+					uint64_t end_time_ps = start_time_ps + (occupancy_cycles * period_ps);
 					if (end_time_ps > vector_time_ps_) {
 						vector_time_ps_ = end_time_ps;
 					}
@@ -1071,7 +1102,7 @@ class VExtension {
 		if (is_masked_instr) {
 			evl = std::ceil((float)iss.csrs.vl.reg.val / 8.0);
 		} else if (ldstType == load_store_type_t::whole) {
-			evl = VLEN / eew;
+			evl = effVlen() / eew;
 		} else {
 			evl = iss.csrs.vl.reg.val;
 		}
@@ -1106,9 +1137,10 @@ class VExtension {
 		xlen_reg_t num_elem_per_reg = VLEN / switchElem;
 		xlen_reg_t vec_idx, elem_num;
 		if (ldstType == load_store_type_t::whole) {
+			xlen_reg_t whole_elem_per_reg = effVlen() / switchElem;
 			xlen_reg_t curr_idx = i * (iss.instr.nf() + 1) + field;
-			vec_idx = iss.instr.rd() + curr_idx / num_elem_per_reg;
-			elem_num = curr_idx % num_elem_per_reg;
+			vec_idx = iss.instr.rd() + curr_idx / whole_elem_per_reg;
+			elem_num = curr_idx % whole_elem_per_reg;
 
 		} else {
 			vec_idx = iss.instr.rd() + field * effective_mul_idx + i / num_elem_per_reg;
@@ -2180,7 +2212,7 @@ class VExtension {
 		xlen_reg_t nreg = iss.instr.rs1() + 1;
 		xlen_reg_t start = iss.csrs.vstart.reg.val;
 		xlen_reg_t sew = getIntVSew();
-		xlen_reg_t evl = nreg * VLEN / sew;
+		xlen_reg_t evl = nreg * effVlen() / sew;
 
 		/* check, if registers are aligned */
 		v_assert(v_is_aligned(iss.instr.rd(), nreg), "rd is not aligned");
@@ -2188,8 +2220,8 @@ class VExtension {
 
 		if (iss.instr.rd() != iss.instr.rs2()) {
 			for (xlen_reg_t idx = start; idx < evl; idx++) {
-				xlen_reg_t reg = idx / (VLEN / sew);
-				xlen_reg_t elem = idx % (VLEN / sew);
+				xlen_reg_t reg = idx / (effVlen() / sew);
+				xlen_reg_t elem = idx % (effVlen() / sew);
 				op_reg_t res = getSewSingleOperand(sew, iss.instr.rs2() + reg, elem, false);
 
 				writeSewSingleOperand(sew, iss.instr.rd() + reg, elem, res);
