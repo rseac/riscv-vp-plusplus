@@ -663,7 +663,28 @@ class VExtension {
 
 					// Sync scalar core to vector issue queue if ARI queue is full (simplified: scalar core is completely decoupled unless syncing)
 					// We only update vector_time_ps_ for scalar syncs (e.g. fence)
-					uint64_t end_time_ps = start_time_ps + (cycles * period_ps);
+					//
+					// FIX 2026-09: this used `cycles` (the full dependent-chain
+					// LATENCY, same value used for reg_ready_time_ps_ -- correct
+					// there, for a genuinely dependent consumer) to advance
+					// vector_time_ps_, which is a DIFFERENT thing: how far the
+					// vector unit's dispatch/decoupling queue has progressed for
+					// scalar-sync purposes, not when this particular result is
+					// visible to a dependent consumer. For a benchmark issuing
+					// many independent vector ops back-to-back (unit-stride
+					// loads/stores dominate particlefilter and somier), each
+					// dispatch pushed vector_time_ps_ out by the full per-
+					// instruction latency (e.g. ~18-46 cyc for a unit-stride
+					// load) instead of the much smaller real occupancy advance
+					// (~4-32 cyc, RTL-measured), so interleaved scalar code
+					// hitting a sync point was forced to "catch up" to an
+					// artificially inflated vector-busy time that doesn't exist
+					// in real (pipelined) hardware -- a latency/occupancy
+					// conflation of the same class already fixed elsewhere in
+					// this file for FU-occupancy accounting, just missed here.
+					// Use occupancy_cycles (already computed above, same value
+					// used for fu_ready_time_ps_) instead.
+					uint64_t end_time_ps = start_time_ps + (occupancy_cycles * period_ps);
 					if (end_time_ps > vector_time_ps_) {
 						vector_time_ps_ = end_time_ps;
 					}

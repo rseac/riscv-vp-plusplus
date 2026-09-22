@@ -7856,5 +7856,6 @@ void ISS_CT::show() {
 	std::cout << "num-instr = " << std::dec << csrs.instret.reg.val << std::endl;
 	// Note: Like mcycles -> Does not contain any cycles that were executed while the CSR bit mcountinhibit.CY was set.
 	std::cout << "num-cycles (mcycle) = " << _compute_and_get_current_cycles() << std::endl;
+	vppp_opclass_debug_dump();
 }
 }  // namespace rv64

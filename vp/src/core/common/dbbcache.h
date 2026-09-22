@@ -117,6 +117,115 @@ struct OpMapEntry {
 	void *labelPtr;
 };
 
+// VPPP_TIMING_DEBUG_OPCLASS: global (not function-local-static, which would
+// silently split across the multiple DBBCache template instantiations --
+// rv32/rv64/rv64_cheriv9 x Dummy/real -- and never print reliably) per-OpId
+// dynamic instruction count and total cost, gated by the same env var. Call
+// vppp_opclass_debug_dump() explicitly from a known-reliable exit point
+// (e.g. right next to "num-cycles (mcycle) = ..." in iss_ctemplate.cpp)
+// rather than relying on a static destructor, which was found NOT to fire
+// reliably for this specific instrumentation.
+struct VpppOpClassDebugGlobal {
+	bool enabled;
+	uint64_t counts[Operation::OpId::NUMBER_OF_OPERATIONS] = {0};
+	uint64_t total_ps[Operation::OpId::NUMBER_OF_OPERATIONS] = {0};
+	VpppOpClassDebugGlobal() : enabled(std::getenv("VPPP_TIMING_DEBUG_OPCLASS") != nullptr) {}
+};
+inline VpppOpClassDebugGlobal g_vppp_opclass_debug;
+
+inline void vppp_opclass_debug_record(Operation::OpId opId, uint64_t instr_time_ps) {
+	if (!g_vppp_opclass_debug.enabled) return;
+	g_vppp_opclass_debug.counts[opId]++;
+	g_vppp_opclass_debug.total_ps[opId] += instr_time_ps;
+}
+
+inline void vppp_opclass_debug_dump() {
+	if (!g_vppp_opclass_debug.enabled) return;
+	fprintf(stderr, "\n[VPPP_TIMING_DEBUG_OPCLASS] Per-OpId scalar instruction breakdown (nonzero only):\n");
+	for (unsigned i = 0; i < Operation::OpId::NUMBER_OF_OPERATIONS; i++) {
+		if (g_vppp_opclass_debug.counts[i] == 0) continue;
+		fprintf(stderr, "  %-16s count=%10llu  total_ps=%14llu  avg_ps=%9.2f\n",
+		        Operation::opIdStr[i], (unsigned long long)g_vppp_opclass_debug.counts[i],
+		        (unsigned long long)g_vppp_opclass_debug.total_ps[i],
+		        (double)g_vppp_opclass_debug.total_ps[i] / (double)g_vppp_opclass_debug.counts[i]);
+	}
+}
+
+// ============================================================================
+// Scalar load-port occupancy model (feature/vppp-ara-scalar-scoreboard)
+//
+// scalar_latencies.md's "Load (L1 D-cache hit): 3 cycles" is a LATENCY
+// number (load-use path, from CVA6ConfigNrLoadPipeRegs=1's structural
+// citation) -- it is NOT a throughput/occupancy number. The existing model
+// has nowhere to represent the difference: opMap[opId].instr_time is a
+// single flat cost charged identically to every dispatch, so a dependent
+// load-then-immediate-use chain and a run of independent back-to-back
+// loads get charged the exact same 3 cycles each, even though real RTL
+// (isolated probes: ubench_scalar_load minus ubench_scalar_loop_overhead
+// baseline) measured independent back-to-back scalar loads (fld/lw/ld
+// alike) reissuing no faster than ~7 cycles apart -- CVA6ConfigNrLoadPipeRegs
+// = 1 means only ONE load can be in flight, a real structural limit on top
+// of the load-use latency, not instead of it.
+//
+// This does NOT need a full register-level RAW-hazard scoreboard (unlike
+// the vector model's reg_ready_time_ps_/fu_ready_time_ps_ split): CVA6 is
+// in-order/single-issue, so the EXISTING strictly-serial cost accumulation
+// already correctly prices a load immediately followed by a consumer of
+// its own result (the consumer's own cost is added only after the load's
+// 3-cycle cost already has been, which is exactly the load-use latency
+// behavior). The ONLY missing piece is an EXTRA stall when a NEW load
+// dispatches before the load port has actually freed up -- i.e. before
+// (occupancy_cycles - latency_cycles) extra cycles have elapsed since the
+// previous load's dispatch, on top of whatever the intervening
+// instructions already charged.
+//
+// occupancy_ps is derived as a multiple of whatever instr_time the
+// property-tree config currently has for THIS load opcode (rather than a
+// hardcoded ps constant), so it stays correct if the underlying latency
+// constant is ever recalibrated: occupancy_ps = latency_ps * (7/3), since
+// RTL measured ~7 cyc occupancy vs the report's existing ~3 cyc latency.
+inline bool vppp_is_scalar_load_opid(Operation::OpId opId) {
+	switch (opId) {
+		case Operation::OpId::LB:
+		case Operation::OpId::LH:
+		case Operation::OpId::LW:
+		case Operation::OpId::LBU:
+		case Operation::OpId::LHU:
+		case Operation::OpId::LWU:
+		case Operation::OpId::LD:
+		case Operation::OpId::FLH:
+		case Operation::OpId::FLW:
+		case Operation::OpId::FLD:
+			return true;
+		default:
+			return false;
+	}
+}
+
+struct VpppScalarLoadPortGlobal {
+	bool enabled;
+	uint64_t load_port_ready_ps = 0;
+	VpppScalarLoadPortGlobal() : enabled(std::getenv("VPPP_SCALAR_LOAD_OCCUPANCY_DISABLE") == nullptr) {}
+};
+inline VpppScalarLoadPortGlobal g_vppp_scalar_load_port;
+
+// Returns the EXTRA stall (in ps) to add on top of the normal opMap cost,
+// and advances the load-port occupancy tracker. `now_ps` must be the
+// cycle_counter_raw value BEFORE the normal opMap instr_time for this
+// instruction is added (i.e. the dispatch time of this load).
+inline uint64_t vppp_scalar_load_port_stall_ps(Operation::OpId opId, uint64_t latency_ps, uint64_t now_ps) {
+	if (!g_vppp_scalar_load_port.enabled) return 0;
+	if (!vppp_is_scalar_load_opid(opId)) return 0;
+	uint64_t occupancy_ps = (latency_ps * 7) / 3;
+	uint64_t extra = 0;
+	if (now_ps < g_vppp_scalar_load_port.load_port_ready_ps) {
+		extra = g_vppp_scalar_load_port.load_port_ready_ps - now_ps;
+	}
+	uint64_t start_ps = now_ps + extra;
+	g_vppp_scalar_load_port.load_port_ready_ps = start_ps + occupancy_ps;
+	return extra;
+}
+
 /******************************************************************************
  * END: MISC
  ******************************************************************************/
@@ -288,7 +397,10 @@ class DBBCacheDummy_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if
 		this->last_pc = this->pc;
 		this->mem_word = fetch_decode(pc, instr, opId);
 		this->pc = pc;
+		cycle_counter_raw += vppp_scalar_load_port_stall_ps(opId, this->opMap[opId].instr_time, cycle_counter_raw);
 		cycle_counter_raw += this->opMap[opId].instr_time;
+		vppp_opclass_debug_record(opId, this->opMap[opId].instr_time);
+
 		return this->opMap[opId].labelPtr;
 	}
 
@@ -1161,7 +1273,10 @@ class DBBCache_T : public DBBCacheBase_T<arch, T_uxlen_t, T_instr_memory_if> {
 			dummyBlock.entries[0].pc_increment = pc - last_pc;
 
 			/* update block cycle counter -> see comments in decode_update_entry above */
+			dummyBlock.entries[1].cycle_counter_raw +=
+			    vppp_scalar_load_port_stall_ps(opId, this->opMap[opId].instr_time, dummyBlock.entries[1].cycle_counter_raw);
 			dummyBlock.entries[1].cycle_counter_raw += this->opMap[opId].instr_time;
+			vppp_opclass_debug_record(opId, this->opMap[opId].instr_time);
 
 			return this->opMap[opId].labelPtr;
 		}
