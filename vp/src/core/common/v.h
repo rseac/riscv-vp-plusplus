@@ -2,10 +2,54 @@
 #include <boost/format.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 // --- XSTop (unified_ooo) Timing Model, Profile B ---
 #include "xs_timing.h"
 #include "xs_timing_classify.h"
+
+// Minimal debug instrumentation, mirroring the AraXL model's
+// VPPP_TIMING_DEBUG mechanism (which this project never had). Enabled via
+// the XS_TIMING_DEBUG env var; zero overhead otherwise. Dumped at process
+// exit so it survives however the simulation is terminated.
+namespace xs_timing_debug {
+struct FuStats {
+	uint64_t count = 0;
+	uint64_t sum_total_cycles = 0;
+	uint64_t sum_hazard_stall = 0;
+};
+struct DebugState {
+	bool enabled = false;
+	FuStats by_fu[24];  // indexed by (uint8_t)XsFU
+	DebugState() { enabled = (std::getenv("XS_TIMING_DEBUG") != nullptr); }
+	~DebugState() {
+		if (!enabled) return;
+		static const char* names[24] = {
+			"VALU", "VMFPU_MUL", "VMFPU_FMA", "VMFPU_FADD", "VMFPU_FNONCOMP",
+			"VMFPU_FCONV", "VMFPU_FDIV", "VMFPU_IDIV", "VLSU_UNIT_LD", "VLSU_UNIT_ST",
+			"VLSU_STRIDED_LD", "VLSU_STRIDED_ST", "VLSU_GATHER", "VLSU_SCATTER",
+			"VREDU_INT", "VREDU_FP", "VSLIDE", "VNARROW", "VMASK", "VMV",
+			"VSETVL", "VWHOLE_REG", "UNKNOWN", "PAD"
+		};
+		fprintf(stderr, "\n[XS_TIMING_DEBUG] Per-FU breakdown:\n");
+		uint64_t grand_total = 0, grand_count = 0;
+		for (int i = 0; i < 23; i++) {
+			const auto& s = by_fu[i];
+			if (s.count == 0) continue;
+			grand_total += s.sum_total_cycles;
+			grand_count += s.count;
+			fprintf(stderr,
+			        "  %-16s count=%8llu  sum_total_cycles=%10llu  avg=%8.2f  sum_hazard_stall=%10llu\n",
+			        names[i], (unsigned long long)s.count, (unsigned long long)s.sum_total_cycles,
+			        (double)s.sum_total_cycles / (double)s.count, (unsigned long long)s.sum_hazard_stall);
+		}
+		fprintf(stderr, "  TOTAL: count=%llu sum_total_cycles=%llu\n",
+		        (unsigned long long)grand_count, (unsigned long long)grand_total);
+	}
+};
+inline DebugState g_debug;
+}  // namespace xs_timing_debug
 
 /*
  * print unmet traps (reasons) to stdout
@@ -45,6 +89,11 @@ class VExtension {
 	// Per-vector-register scoreboard: absolute cycle at which register v[i]'s
 	// result becomes available. Used ONLY to add RAW/WAW stalls (never to credit).
 	uint64_t vreg_ready_cycle_[NUM_REGS] = {0};
+
+	// Per-FU-category structural occupancy: absolute cycle at which this FU
+	// class can accept its next op (throughput-bound), independent of any
+	// register dependency. Indexed by (uint8_t)XsFU; 24 categories today.
+	uint64_t fu_busy_until_[24] = {0};
 
 	// Fixed synchronous issue latency injected for every dispatched vector op
 	// (models the in-order front-end accept cost W_v). Kept small & positive.
@@ -359,7 +408,13 @@ class VExtension {
 		iss.csrs.vstart.reg.val = 0;
 
 		if (is_fp) {
-			iss.fp_finish_instr();
+			// Vector FP ops: fp_finish_instr() still handles dirty/exception
+			// flags, but current_opId_ won't match any scalar FP case in
+			// classifyScalarFp() (see iss_ctemplate.cpp), so the new scalar
+			// FP scoreboard added there is correctly a no-op here -- vector
+			// FP timing remains entirely owned by this class's own
+			// vreg_ready_cycle_ scoreboard below.
+			iss.fp_finish_instr(current_opId_);
 		}
 
 		// ============ XSTop Profile B: dynamic vector cycle injection ============
@@ -450,6 +505,39 @@ class VExtension {
 				for (uint32_t k = 0; k < span && (vd + k) < NUM_REGS; ++k)
 					start = std::max(start, vreg_ready_cycle_[vd + k]);
 
+				// FIX 2026-09: structural FU-occupancy hazard, independent of
+				// any register dependency. A real pipelined FU can only accept
+				// a new op every n_beats cycles regardless of which registers
+				// are involved; the register-only scoreboard above missed this
+				// for BURSTS of independent-register ops (e.g. lavamd's 4
+				// strided loads/iteration into 4 different destination regs --
+				// confirmed via a real-RTL probe reproducing that exact burst:
+				// RTL averaged ~5.0 cyc/load with hazard_stall from the
+				// register scoreboard alone measuring only ~0.25 cyc/load,
+				// since a 4-cycle same-register reuse gap mostly hid the
+				// per-load latency. n_beats (already computed per FU category
+				// but previously dead/unused) is exactly the missing occupancy
+				// term. Tracked per XsFU category (not a single shared LSU
+				// queue) as a first-order fix.
+				//
+				// Applied unconditionally (not gated on the register hazard):
+				// with xs_timing.h's VLSU_UNIT_LD/ST split fix, total_cycles
+				// (latency, feeds vreg_ready_cycle_ / RAW consumers) and
+				// n_beats (occupancy, feeds fu_busy_until_ here) are now
+				// DIFFERENT quantities -- latency stays the true flat L1-hit
+				// cost, throughput lives only in n_beats. An earlier version
+				// of this fix conflated the two (both categories got the same
+				// inflated value), which double-counted the same structural
+				// cost for any FU whose result is immediately RAW-consumed
+				// (confirmed via pathfinder_agnostic: -49.6% -> +49.6%, same
+				// magnitude, the double-counting signature). Gating on
+				// start==now was an earlier, ineffective attempt at a fix --
+				// pathfinder's chain instructions still satisfied start==now
+				// at this point (their own RAW wait was already resolved by
+				// elapsed time from other instructions), so gating changed
+				// nothing; the real bug was upstream in xs_timing.h.
+				start = std::max(start, fu_busy_until_[(uint8_t)fu]);
+
 				// The hazard stall the scalar core actually observes.
 				uint64_t hazard_stall = (start > now) ? (start - now) : 0;
 
@@ -468,6 +556,18 @@ class VExtension {
 				uint64_t done = issue_cycle + exec_cycles;
 				for (uint32_t k = 0; k < span && (vd + k) < NUM_REGS; ++k)
 					vreg_ready_cycle_[vd + k] = done;
+
+				// FU becomes free again for its NEXT op after n_beats (occupancy,
+				// throughput-bound) -- distinct from `done` (result latency,
+				// which gates CONSUMERS of the register, not the FU itself).
+				fu_busy_until_[(uint8_t)fu] = issue_cycle + std::max<uint64_t>(lat.n_beats, 1);
+
+				if (xs_timing_debug::g_debug.enabled) {
+					auto& s = xs_timing_debug::g_debug.by_fu[(int)(uint8_t)fu];
+					s.count++;
+					s.sum_total_cycles += exec_cycles;
+					s.sum_hazard_stall += hazard_stall;
+				}
 			}
 		}
 

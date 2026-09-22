@@ -47,7 +47,18 @@ namespace xs_timing {
 enum class XsFU : uint8_t {
 	VALU,            // Integer ALU (vadd, vsub, vand, vor, vsll, vmseq, vmerge, ...)
 	VMFPU_MUL,       // Integer multiply (vmul, vmulh, vsmul, vmacc, vwmul)
-	VMFPU_FMA,       // FP arithmetic (vfadd, vfmul, vfmacc, ...) -> VFMA core (3)
+	VMFPU_FMA,       // FP fused multiply-add/sub (vfmacc, vfmadd, vfmsac, ...) ->
+	                 // VFMA core (3). Reads its own destination as a third
+	                 // operand for accumulation, unlike VMFPU_FADD below.
+	VMFPU_FADD,      // FP simple 2-operand arithmetic (vfadd, vfsub, vfrsub,
+	                 // vfmul) -> VFAlu-class core (1), split out from VMFPU_FMA
+	                 // 2026-09. math_model_approved.md §6.2 already documents
+	                 // vfadd_m1≈6.21 (L_core=1) vs vfmacc_m1≈8.13 (L_core=3) as
+	                 // separately measured RTL values, but the classifier had
+	                 // collapsed both into one XsFU::VMFPU_FMA category using
+	                 // only the more expensive depth -- confirmed real,
+	                 // ~33%/instr overestimate on any vfadd/vfmul-dominated
+	                 // dependent chain (e.g. jacobi2d's 5-point stencil).
 	VMFPU_FNONCOMP,  // FP non-computational (vfmin, vfmax, vfsgnj) -> VFAlu core (1)
 	VMFPU_FCONV,     // FP conversion (vfcvt*, vfwcvt*, vfncvt*)   -> VCVT core (2)
 	VMFPU_FDIV,      // FP div/sqrt (iterative)
@@ -135,6 +146,12 @@ struct XsConfig {
 	uint32_t c_strided_flow;         // per-uop flow cost ~= 3
 	uint32_t p_line_max;             // per-line fill at small stride ~= 6
 	uint32_t c_strided_wb;           // strided writeback ~= 1
+	// Structural FU-occupancy for a strided load/store (throughput, not
+	// latency) -- feeds n_beats, enforced via v.h's fu_busy_until_. Distinct
+	// from c_strided_flow (which feeds the single-shot LATENCY anchor) since
+	// RTL-calibrated burst throughput and isolated-access latency differ.
+	// RTL probe: real-RTL default (~1 elem = 1 numOfUopArith at LMUL=1).
+	uint32_t c_strided_occupancy;
 	// Indexed gather per-index round-trip (anchor 11.30 cyc/it).
 	uint32_t c_gather_rt_x10;        // per-index (tlb+cache+merge) x10 ~= 113
 	// Iterative divide.
@@ -142,10 +159,22 @@ struct XsConfig {
 	uint32_t c_div_drain;   // s_finish->s_idle drain = 1 (HIGH)
 	uint32_t r_div;         // quotient bits/iter (radix-16) = 4 (HIGH)
 	uint32_t c_reissue;     // reissue hop between dependent divides (LOW anchor) ~= 2
+	// FP divide/sqrt (VMFPU_FDIV) uses a typical, not worst-case, iteration
+	// count -- see the VMFPU_FDIV case in computeCycles() for derivation.
+	// Backed out from math_model_approved.md Sec 6.1's "fdiv_d~=14.69"
+	// anchor (LOW confidence, empirical): 14.69 - c_reissue - w_s -
+	// c_div_fixed - c_div_drain ~= 3.7 -> 4.
+	uint32_t fdiv_n_iter_typical;
 
 	// --- Memory (tunable, UNVALIDATED off-die) ---
 	uint32_t t_l1hit;  // L1D hit load-to-use core depth = 3
 	uint32_t tau_mem;  // miss/DRAM adder (tunable)
+	// Sustained unit-stride vector-memory throughput cap (elements/cycle).
+	// RTL-calibrated: real bandwidth sweep (see VLSU_UNIT_LD/ST case) measured
+	// 1.00 cyc/elem steady-state for e32 unit-stride loads, independent of
+	// working-set size (a real prefetcher hides capacity-driven misses for
+	// this access pattern) and independent of LMUL/vl grouping.
+	uint32_t peak_elems_per_cycle;
 
 	XsConfig()
 	    : vlen(128), dlen(128), nr_lanes(2),
@@ -156,10 +185,11 @@ struct XsConfig {
 	      c_dep_resync(4), c_uop_arith(2), c_fill(5),
 	      c_uop_red_x10(12), c_red_fixed(2), c_red_fold(1), c_perm_uop(2),
 	      l_fadd(3), c_red_fp_fixed(2),
-	      c_strided_flow(3), p_line_max(6), c_strided_wb(1),
+	      c_strided_flow(3), p_line_max(6), c_strided_wb(1), c_strided_occupancy(4),
 	      c_gather_rt_x10(113),
 	      c_div_fixed(6), c_div_drain(1), r_div(4), c_reissue(2),
-	      t_l1hit(3), tau_mem(10) {}
+	      fdiv_n_iter_typical(4),
+	      t_l1hit(3), tau_mem(10), peak_elems_per_cycle(1) {}
 };
 
 /*
@@ -239,6 +269,8 @@ class XsTimingModel {
 				return cfg_.lcore_vmul;              // VIMacU = 2
 			case XsFU::VMFPU_FMA:
 				return cfg_.lcore_vfma;              // VFMA = 3
+			case XsFU::VMFPU_FADD:
+				return cfg_.lcore_vfalu;             // VFAlu-class = 1 (see VMFPU_FADD comment)
 			case XsFU::VMFPU_FNONCOMP:
 				return cfg_.lcore_vfalu;             // VFAlu = 1
 			case XsFU::VMFPU_FCONV:
@@ -276,6 +308,7 @@ class XsTimingModel {
 			case XsFU::VALU:
 			case XsFU::VMFPU_MUL:
 			case XsFU::VMFPU_FMA:
+			case XsFU::VMFPU_FADD:
 			case XsFU::VMFPU_FNONCOMP:
 			case XsFU::VMFPU_FCONV:
 			case XsFU::VNARROW:
@@ -288,18 +321,44 @@ class XsTimingModel {
 				break;
 			}
 
-			// ---- Iterative integer / FP divide (math model §3.1, 5.2, 6.1) ----
+			// ---- Iterative integer divide (math model §3.1, 6.1) ----
 			// L_single = W_s + C_div_fixed + N_iter + C_div_drain, N_iter in [0,16].
 			// Dependent-chain aggregate adds C_reissue (non-pipelined FSM reissue).
-			case XsFU::VMFPU_IDIV:
-			case XsFU::VMFPU_FDIV: {
-				// N_iter is data dependent; without operand magnitude we use the
-				// worst-case iteration bound XLEN/R_div, matching the 25.60 anchor
-				// point (L_total(max) + C_reissue). The calibrator can tune C_reissue.
+			// N_iter is data dependent; without operand magnitude we use the
+			// worst-case iteration bound XLEN/R_div, matching the SCALAR INTEGER
+			// divide's own documented 25.60 anchor point (L_total(max) +
+			// C_reissue). This worst-case treatment is only validated for
+			// integer divide -- see VMFPU_FDIV below for why FP divide/sqrt
+			// must NOT share this formula.
+			case XsFU::VMFPU_IDIV: {
 				uint32_t xlen_bits = 64;
 				uint32_t n_iter_max = xlen_bits / (cfg_.r_div ? cfg_.r_div : 4);
 				uint64_t L_single =
 				    cfg_.w_s + cfg_.c_div_fixed + n_iter_max + cfg_.c_div_drain;
+				out.total_cycles = L_single + cfg_.c_reissue;
+				out.n_beats = out.total_cycles;  // non-pipelined: full occupancy
+				break;
+			}
+
+			// ---- Iterative FP divide/sqrt (math model §6.1) ----
+			// FIX 2026-09: this used to share VMFPU_IDIV's worst-case-N_iter
+			// formula (n_iter_max=16, total~27), matching the SCALAR INTEGER
+			// divide's 25.60 anchor -- but math_model_approved.md Sec 6.1's own
+			// table documents a SEPARATE, much lower empirical anchor for FP
+			// divide/sqrt specifically: "Scalar FP div/sqrt ... fdiv_d≈14.69",
+			// not 25.60. Confirmed via real XiangShan RTL: a probe reproducing
+			// somier's exact vfsqrt/vfdiv dependency chain (distance -> sum of
+			// squares -> sqrt -> spring force -> divide, with real memory
+			// loads/stores) measured the full chain at 858 cycles on RTL vs.
+			// 1593 on this model (+85.7%, vs. somier's own +74.1% -- the two
+			// track closely, confirming this chain IS the dominant driver).
+			// Backing out the model's own 14.69 anchor: 14.69 - c_reissue(2) -
+			// w_s(2) - c_div_fixed(6) - c_div_drain(1) ~= 3.7 -> use a typical
+			// iteration count of 4 instead of the worst-case 16.
+			case XsFU::VMFPU_FDIV: {
+				uint32_t n_iter_typical = cfg_.fdiv_n_iter_typical;
+				uint64_t L_single =
+				    cfg_.w_s + cfg_.c_div_fixed + n_iter_typical + cfg_.c_div_drain;
 				out.total_cycles = L_single + cfg_.c_reissue;
 				out.n_beats = out.total_cycles;  // non-pipelined: full occupancy
 				break;
@@ -344,11 +403,55 @@ class XsTimingModel {
 
 			// ---- Unit-stride memory (math model §5.7, 6.3) ----
 			// Pipeline overhead only; TLM memory latency accumulates separately.
-			case XsFU::VLSU_UNIT_LD:
-			case XsFU::VLSU_UNIT_ST:
 			case XsFU::VWHOLE_REG: {
 				out.total_cycles = cfg_.w_m + cfg_.t_l1hit;  // L1-hit load-to-use
 				out.n_beats = out.total_cycles;
+				break;
+			}
+
+			// FIX 2026-09: VLSU_UNIT_LD/ST used to share VWHOLE_REG's flat
+			// "latency-only" formula (w_m + t_l1hit = 4 cycles), independent of
+			// vl/LMUL. Confirmed via a real-RTL bandwidth sweep (unit-stride
+			// vle32.v, e32/m4/vl=16, working set swept 4KB->256KB, well past
+			// XiangShan's real 32KB L1D): measured cycles/element converged to
+			// EXACTLY 1.00 (1081/1071/16441/65625 cycles for 64/64/1024/4096
+			// vector loads of 16 elements each -> 1.06, 1.05, 1.00, 1.00
+			// cyc/elem), REGARDLESS of working-set size -- ruling out a
+			// cache-capacity/miss explanation (a real sequential prefetcher
+			// hides that) in favor of a flat ~1 element/cycle sustained LSU
+			// throughput cap that the old formula never charged for
+			// high-LMUL / high-vl unit-stride ops.
+			//
+			// CORRECTION 2026-09: the sweep measures sustained ISSUE
+			// THROUGHPUT (how often the LSU can accept a NEW request), not
+			// per-request LATENCY (how long until ONE request's result is
+			// ready for a dependent consumer) -- a deep, overlapped pipeline
+			// can sustain 1 elem/cycle issue rate while any SINGLE result is
+			// still ready in just the flat L1-hit depth. The mem-sweep probe
+			// only measured the combined quantity because it reused the same
+			// destination register every iteration (WAW-forced reissue), which
+			// happens to make sustained throughput visible through the
+			// latency channel. Originally this file set BOTH total_cycles
+			// (latency, gates RAW consumers via vreg_ready_cycle_) AND
+			// n_beats (occupancy, should gate same-FU reissue only) to the
+			// inflated throughput value -- this incorrectly inflated the
+			// LATENCY seen by genuinely-independent downstream consumers too.
+			// Confirmed via pathfinder_agnostic (vle32.v -> vslide -> vmin ->
+			// vadd -> vse32.v, a tight RAW chain): conflating the two flipped
+			// its error from -49.6% (underestimate) to +49.6% (overestimate,
+			// identical magnitude) -- the signature of charging one real cost
+			// twice. Fix: keep total_cycles as the true flat latency; route
+			// the throughput cap through n_beats only (enforced by v.h's
+			// fu_busy_until_ occupancy tracker, which gates same-category
+			// reissue without touching RAW-consumer latency).
+			case XsFU::VLSU_UNIT_LD:
+			case XsFU::VLSU_UNIT_ST: {
+				uint64_t latency_term = cfg_.w_m + cfg_.t_l1hit;
+				uint64_t elems = desc.vl ? desc.vl : 1;
+				uint32_t peak = cfg_.peak_elems_per_cycle ? cfg_.peak_elems_per_cycle : 1;
+				uint64_t throughput_term = (elems + peak - 1) / peak;  // ceil
+				out.total_cycles = latency_term;       // latency: unchanged, real RAW cost
+				out.n_beats = std::max(latency_term, throughput_term);  // occupancy only
 				break;
 			}
 
@@ -356,7 +459,7 @@ class XsTimingModel {
 			case XsFU::VLSU_STRIDED_LD:
 			case XsFU::VLSU_STRIDED_ST: {
 				out.total_cycles = stridedLatency(desc);          // use latency (flat-ish)
-				out.n_beats = (uint64_t)numOfUopArith(desc) * cfg_.c_strided_flow; // occupancy
+				out.n_beats = (uint64_t)numOfUopArith(desc) * cfg_.c_strided_occupancy; // occupancy
 				break;
 			}
 

@@ -161,6 +161,20 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	}
 
 	/**
+	 * Per-FP-register scoreboard (RAW/WAW), mirroring VExtension's
+	 * per-vector-register vreg_ready_cycle_ in v.h. Absolute cycle at which
+	 * register f[i]'s result becomes available. Used ONLY to add stalls
+	 * (never to credit) -- see fp_finish_instr().
+	 */
+	uint64_t freg_ready_cycle_[32] = {0};
+
+	__always_inline uint64_t xs_now_cycle() {
+		uint64_t period = get_clock_cycle_period_ps();
+		if (period == 0) return 0;
+		return dbbcache.get_cycle_counter_raw() / period;
+	}
+
+	/**
 	 * Sync hook for coprocessor-to-scalar extract ops and serializing ops.
 	 *
 	 * Profile B (unified_ooo): there is NO ARI queue and NO scalar hiding. The only
@@ -268,7 +282,24 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	}
 
 	void fp_prepare_instr();
-	void fp_finish_instr();
+	// P1-style fix, 2026-09: XSTop is a unified OoO core where scalar
+	// instructions previously had NO overlap modeling at all -- every scalar
+	// op's full flat latency (opMap[opId].instr_time, e.g. FADD_S=3,
+	// FDIV_S=15) was charged unconditionally and additively at fetch/decode
+	// time (dbbcache.h), with no concept of whether it actually depended on
+	// the previous instruction. That's equivalent to assuming every scalar
+	// instruction sequence is a fully dependent chain, always -- confirmed
+	// to cause severe overestimates on FP-heavy scalar code (blackscholes's
+	// CNDF polynomial: +143.6%; jacobi2d's scalar reference region: +404%).
+	// Fix: property-tree scalar FP *_instr_clock_cycles values now represent
+	// the independent/pipelined ISSUE cost only (should be set small, e.g.
+	// 1); this function adds a per-FP-register (freg_ready_cycle_) RAW/WAW
+	// scoreboard, mirroring VExtension's existing per-vector-register one in
+	// v.h, and injects ADDITIONAL positive-only stall cycles up to the real
+	// structural dependent-chain latency (scalarFpLatency() below, matching
+	// math_model_approved.md Sec 6.1's HIGH-confidence static DFF values)
+	// only when a genuine RAW/WAW hazard is detected.
+	void fp_finish_instr(Operation::OpId opId);
 	void fp_set_dirty();
 	void fp_update_exception_flags();
 	void fp_setup_rm();

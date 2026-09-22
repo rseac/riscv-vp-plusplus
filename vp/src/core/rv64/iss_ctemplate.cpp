@@ -1500,7 +1500,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_add(fp_regs.f16(RS1), fp_regs.f16(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FADD_H);
 				}
 				OP_END();
 
@@ -1508,7 +1508,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_sub(fp_regs.f16(RS1), fp_regs.f16(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FSUB_H);
 				}
 				OP_END();
 
@@ -1516,7 +1516,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_mul(fp_regs.f16(RS1), fp_regs.f16(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMUL_H);
 				}
 				OP_END();
 
@@ -1524,7 +1524,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_div(fp_regs.f16(RS1), fp_regs.f16(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FDIV_H);
 				}
 				OP_END();
 
@@ -1532,7 +1532,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_sqrt(fp_regs.f16(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FSQRT_H);
 				}
 				OP_END();
 
@@ -1557,7 +1557,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 							fp_regs.write(RD, fp_regs.f16(RS2));
 					}
 
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMIN_H);
 				}
 				OP_END();
 
@@ -1582,7 +1582,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 							fp_regs.write(RD, fp_regs.f16(RS2));
 					}
 
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMAX_H);
 				}
 				OP_END();
 
@@ -1590,7 +1590,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_mulAdd(fp_regs.f16(RS1), fp_regs.f16(RS2), fp_regs.f16(RS3)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMADD_H);
 				}
 				OP_END();
 
@@ -1598,7 +1598,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_mulAdd(fp_regs.f16(RS1), fp_regs.f16(RS2), f16_neg(fp_regs.f16(RS3))));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMSUB_H);
 				}
 				OP_END();
 
@@ -1607,7 +1607,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_setup_rm();
 					fp_regs.write(RD,
 					              f16_mulAdd(f16_neg(fp_regs.f16(RS1)), fp_regs.f16(RS2), f16_neg(fp_regs.f16(RS3))));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FNMADD_H);
 				}
 				OP_END();
 
@@ -1615,7 +1615,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_mulAdd(f16_neg(fp_regs.f16(RS1)), fp_regs.f16(RS2), fp_regs.f16(RS3)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FNMSUB_H);
 				}
 				OP_END();
 
@@ -1698,7 +1698,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f16_to_i32(fp_regs.f16(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_W_H);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -1707,7 +1707,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = (int32_t)f16_to_ui32(fp_regs.f16(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_WU_H);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -1716,7 +1716,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, i32_to_f16((int32_t)regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_H_W);
 				}
 				OP_END();
 
@@ -1724,7 +1724,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, ui32_to_f16((int32_t)regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_H_WU);
 				}
 				OP_END();
 
@@ -1732,7 +1732,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_to_f32(fp_regs.f16(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_S_H);
 				}
 				OP_END();
 
@@ -1740,7 +1740,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_to_f16(fp_regs.f32(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_H_S);
 				}
 				OP_END();
 
@@ -1748,7 +1748,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_to_f16(fp_regs.f64(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_H_D);
 				}
 				OP_END();
 
@@ -1756,7 +1756,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_to_f64(fp_regs.f16(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_D_H);
 				}
 				OP_END();
 
@@ -1764,7 +1764,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f16_to_i64(fp_regs.f16(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_L_H);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -1773,7 +1773,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f16_to_ui64(fp_regs.f16(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_LU_H);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -1782,7 +1782,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, i64_to_f16(regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_H_L);
 				}
 				OP_END();
 
@@ -1790,7 +1790,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, ui64_to_f16(regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_H_LU);
 				}
 				OP_END();
 
@@ -1820,7 +1820,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_add(fp_regs.f32(RS1), fp_regs.f32(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FADD_S);
 				}
 				OP_END();
 
@@ -1828,7 +1828,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_sub(fp_regs.f32(RS1), fp_regs.f32(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FSUB_S);
 				}
 				OP_END();
 
@@ -1836,7 +1836,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_mul(fp_regs.f32(RS1), fp_regs.f32(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMUL_S);
 				}
 				OP_END();
 
@@ -1844,7 +1844,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_div(fp_regs.f32(RS1), fp_regs.f32(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FDIV_S);
 				}
 				OP_END();
 
@@ -1852,7 +1852,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_sqrt(fp_regs.f32(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FSQRT_S);
 				}
 				OP_END();
 
@@ -1877,7 +1877,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 							fp_regs.write(RD, fp_regs.f32(RS2));
 					}
 
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMIN_S);
 				}
 				OP_END();
 
@@ -1902,7 +1902,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 							fp_regs.write(RD, fp_regs.f32(RS2));
 					}
 
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMAX_S);
 				}
 				OP_END();
 
@@ -1910,7 +1910,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_mulAdd(fp_regs.f32(RS1), fp_regs.f32(RS2), fp_regs.f32(RS3)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMADD_S);
 				}
 				OP_END();
 
@@ -1918,7 +1918,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_mulAdd(fp_regs.f32(RS1), fp_regs.f32(RS2), f32_neg(fp_regs.f32(RS3))));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMSUB_S);
 				}
 				OP_END();
 
@@ -1927,7 +1927,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_setup_rm();
 					fp_regs.write(RD,
 					              f32_mulAdd(f32_neg(fp_regs.f32(RS1)), fp_regs.f32(RS2), f32_neg(fp_regs.f32(RS3))));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FNMADD_S);
 				}
 				OP_END();
 
@@ -1935,7 +1935,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_mulAdd(f32_neg(fp_regs.f32(RS1)), fp_regs.f32(RS2), fp_regs.f32(RS3)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FNMSUB_S);
 				}
 				OP_END();
 
@@ -1943,7 +1943,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f32_to_i32(fp_regs.f32(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_W_S);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -1952,7 +1952,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = (int32_t)f32_to_ui32(fp_regs.f32(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_WU_S);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -1961,7 +1961,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, i32_to_f32((int32_t)regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_S_W);
 				}
 				OP_END();
 
@@ -1969,7 +1969,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, ui32_to_f32((int32_t)regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_S_WU);
 				}
 				OP_END();
 
@@ -2049,7 +2049,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f32_to_i64(fp_regs.f32(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_L_S);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -2058,7 +2058,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f32_to_ui64(fp_regs.f32(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_LU_S);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -2067,7 +2067,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, i64_to_f32(regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_S_L);
 				}
 				OP_END();
 
@@ -2075,7 +2075,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, ui64_to_f32(regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_S_LU);
 				}
 				OP_END();
 
@@ -2105,7 +2105,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_add(fp_regs.f64(RS1), fp_regs.f64(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FADD_D);
 				}
 				OP_END();
 
@@ -2113,7 +2113,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_sub(fp_regs.f64(RS1), fp_regs.f64(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FSUB_D);
 				}
 				OP_END();
 
@@ -2121,7 +2121,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_mul(fp_regs.f64(RS1), fp_regs.f64(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMUL_D);
 				}
 				OP_END();
 
@@ -2129,7 +2129,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_div(fp_regs.f64(RS1), fp_regs.f64(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FDIV_D);
 				}
 				OP_END();
 
@@ -2137,7 +2137,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_sqrt(fp_regs.f64(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FSQRT_D);
 				}
 				OP_END();
 
@@ -2162,7 +2162,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 							fp_regs.write(RD, fp_regs.f64(RS2));
 					}
 
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMIN_D);
 				}
 				OP_END();
 
@@ -2187,7 +2187,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 							fp_regs.write(RD, fp_regs.f64(RS2));
 					}
 
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMAX_D);
 				}
 				OP_END();
 
@@ -2195,7 +2195,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_mulAdd(fp_regs.f64(RS1), fp_regs.f64(RS2), fp_regs.f64(RS3)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMADD_D);
 				}
 				OP_END();
 
@@ -2203,7 +2203,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_mulAdd(fp_regs.f64(RS1), fp_regs.f64(RS2), f64_neg(fp_regs.f64(RS3))));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMSUB_D);
 				}
 				OP_END();
 
@@ -2212,7 +2212,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_setup_rm();
 					fp_regs.write(RD,
 					              f64_mulAdd(f64_neg(fp_regs.f64(RS1)), fp_regs.f64(RS2), f64_neg(fp_regs.f64(RS3))));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FNMADD_D);
 				}
 				OP_END();
 
@@ -2220,7 +2220,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_mulAdd(f64_neg(fp_regs.f64(RS1)), fp_regs.f64(RS2), fp_regs.f64(RS3)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FNMSUB_D);
 				}
 				OP_END();
 
@@ -2300,7 +2300,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f64_to_i32(fp_regs.f64(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_W_D);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -2309,7 +2309,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = (int32_t)f64_to_ui32(fp_regs.f64(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_WU_D);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -2318,7 +2318,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, i32_to_f64((int32_t)regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_D_W);
 				}
 				OP_END();
 
@@ -2326,7 +2326,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, ui32_to_f64((int32_t)regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_D_WU);
 				}
 				OP_END();
 
@@ -2334,7 +2334,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_to_f32(fp_regs.f64(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_S_D);
 				}
 				OP_END();
 
@@ -2342,7 +2342,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_to_f64(fp_regs.f32(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_D_S);
 				}
 				OP_END();
 
@@ -2350,7 +2350,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f64_to_i64(fp_regs.f64(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_L_D);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -2359,7 +2359,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f64_to_ui64(fp_regs.f64(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_LU_D);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -2368,7 +2368,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, i64_to_f64(regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_D_L);
 				}
 				OP_END();
 
@@ -2376,7 +2376,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, ui64_to_f64(regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_D_LU);
 				}
 				OP_END();
 
@@ -7515,9 +7515,114 @@ std::vector<uint64_t> ISS_CT::get_registers(void) {
 	return regvals;
 }
 
-void ISS_CT::fp_finish_instr() {
+namespace {
+// Per-opcode scalar FP register-file/latency metadata for the scoreboard in
+// fp_finish_instr(). Latency values are the HIGH-confidence structural DFF
+// depths from math_model_approved.md Sec 6.1 (ALU/FAlu=3, Mul=4, FCVT=4,
+// FMA=5); FDIV/FSQRT use a flat 15 matching this project's existing
+// FDIV_S_instr_clock_cycles config default (the real per-state formula is
+// data-dependent, 9..25 -- 15 is the documented single-point anchor, not a
+// full recalibration of the iterative divider path, which is out of scope
+// here). H (half-precision) variants share their S/D siblings' latency.
+struct ScalarFpOpInfo {
+	bool valid;          // false => not a scalar FP op fp_finish_instr() scoreboards
+	bool rs1_fpr, rs2_fpr, rs3_fpr;  // which source operands are FP-register reads
+	bool rd_fpr;         // false => writes a GPR (FCVT-to-int, FMV_X_*, FEQ/FLT/FLE/FCLASS)
+	uint32_t latency;
+};
+
+ScalarFpOpInfo classifyScalarFp(Operation::OpId opId) {
+	using Op = Operation::OpId;
+	switch (opId) {
+		// ---- FAlu class (latency 3): fp-fp arithmetic/compare/sign-inject/minmax ----
+		case Op::FADD_S: case Op::FADD_D: case Op::FADD_H:
+		case Op::FSUB_S: case Op::FSUB_D: case Op::FSUB_H:
+		case Op::FSGNJ_S: case Op::FSGNJ_D: case Op::FSGNJ_H:
+		case Op::FSGNJN_S: case Op::FSGNJN_D: case Op::FSGNJN_H:
+		case Op::FSGNJX_S: case Op::FSGNJX_D: case Op::FSGNJX_H:
+		case Op::FMIN_S: case Op::FMIN_D: case Op::FMIN_H:
+		case Op::FMAX_S: case Op::FMAX_D: case Op::FMAX_H:
+			return {true, true, true, false, true, 3};
+		// Compare ops: read two FPR sources, write a GPR (comparison result).
+		case Op::FEQ_S: case Op::FEQ_D: case Op::FEQ_H:
+		case Op::FLT_S: case Op::FLT_D: case Op::FLT_H:
+		case Op::FLE_S: case Op::FLE_D: case Op::FLE_H:
+			return {true, true, true, false, false, 3};
+		// FCLASS: one FPR source, writes a GPR.
+		case Op::FCLASS_S: case Op::FCLASS_D: case Op::FCLASS_H:
+			return {true, true, false, false, false, 3};
+
+		// ---- Mul class (latency 4) ----
+		case Op::FMUL_S: case Op::FMUL_D: case Op::FMUL_H:
+			return {true, true, true, false, true, 4};
+
+		// ---- FCVT class (latency 4) ----
+		// FP -> FP precision conversion: FPR in, FPR out.
+		case Op::FCVT_S_D: case Op::FCVT_D_S:
+		case Op::FCVT_S_H: case Op::FCVT_H_S:
+		case Op::FCVT_D_H: case Op::FCVT_H_D:
+			return {true, true, false, false, true, 4};
+		// FP -> int: FPR in, GPR out.
+		case Op::FCVT_W_S: case Op::FCVT_WU_S: case Op::FCVT_L_S: case Op::FCVT_LU_S:
+		case Op::FCVT_W_D: case Op::FCVT_WU_D: case Op::FCVT_L_D: case Op::FCVT_LU_D:
+		case Op::FCVT_W_H: case Op::FCVT_WU_H: case Op::FCVT_L_H: case Op::FCVT_LU_H:
+			return {true, true, false, false, false, 4};
+		// int -> FP: GPR in, FPR out.
+		case Op::FCVT_S_W: case Op::FCVT_S_WU: case Op::FCVT_S_L: case Op::FCVT_S_LU:
+		case Op::FCVT_D_W: case Op::FCVT_D_WU: case Op::FCVT_D_L: case Op::FCVT_D_LU:
+		case Op::FCVT_H_W: case Op::FCVT_H_WU: case Op::FCVT_H_L: case Op::FCVT_H_LU:
+			return {true, false, false, false, true, 4};
+		// FMV bit-moves: same register-file pattern as FCVT-to/from-int, cheap (2).
+		case Op::FMV_X_W: case Op::FMV_X_D: case Op::FMV_X_H:
+			return {true, true, false, false, false, 2};
+		case Op::FMV_W_X: case Op::FMV_D_X: case Op::FMV_H_X:
+			return {true, false, false, false, true, 2};
+
+		// ---- FMA class (latency 5): three FPR sources (rs1,rs2,rs3), one FPR dest ----
+		case Op::FMADD_S: case Op::FMADD_D: case Op::FMADD_H:
+		case Op::FMSUB_S: case Op::FMSUB_D: case Op::FMSUB_H:
+		case Op::FNMADD_S: case Op::FNMADD_D: case Op::FNMADD_H:
+		case Op::FNMSUB_S: case Op::FNMSUB_D: case Op::FNMSUB_H:
+			return {true, true, true, true, true, 5};
+
+		// ---- Iterative divide/sqrt: flat anchor (see comment above) ----
+		case Op::FDIV_S: case Op::FDIV_D: case Op::FDIV_H:
+			return {true, true, true, false, true, 15};
+		case Op::FSQRT_S: case Op::FSQRT_D: case Op::FSQRT_H:
+			return {true, true, false, false, true, 15};
+
+		default:
+			return {false, false, false, false, false, 0};
+	}
+}
+}  // namespace
+
+void ISS_CT::fp_finish_instr(Operation::OpId opId) {
 	fp_set_dirty();
 	fp_update_exception_flags();
+
+	// ============ XSTop Profile B: scalar FP register scoreboard ============
+	// See the header comment on fp_finish_instr() for the full rationale.
+	ScalarFpOpInfo info = classifyScalarFp(opId);
+	if (info.valid) {
+		uint64_t now = xs_now_cycle();
+		uint64_t start = now;
+
+		if (info.rs1_fpr) start = std::max(start, freg_ready_cycle_[RS1]);
+		if (info.rs2_fpr) start = std::max(start, freg_ready_cycle_[RS2]);
+		if (info.rs3_fpr) start = std::max(start, freg_ready_cycle_[instr.rs3()]);
+		// WAW: don't let this write clobber an in-flight write to the same reg.
+		if (info.rd_fpr) start = std::max(start, freg_ready_cycle_[RD]);
+
+		uint64_t hazard_stall = (start > now) ? (start - now) : 0;
+		if (hazard_stall > 0) {
+			xs_inject_cycles(hazard_stall);
+		}
+
+		if (info.rd_fpr) {
+			freg_ready_cycle_[RD] = start + info.latency;
+		}
+	}
 }
 
 void ISS_CT::fp_prepare_instr() {
