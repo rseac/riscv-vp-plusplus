@@ -157,6 +157,16 @@ class VExtension {
 		scalar_hiding_enabled_ = enable_scalar_hiding;
 		timing_model_ = new ara_timing::AraTimingModel(cfg);
 		timing_enabled_ = true;
+		// Architectural vlenb must reflect the configured hardware VLEN, not the
+		// ISS storage width (VLEN constant above).
+		iss.csrs.vlenb.reg.val = effVlen() / 8;
+	}
+
+	// Hardware VLEN in bits as seen by software (whole-register ops, vlenb CSR).
+	unsigned effVlen() const {
+		if (timing_enabled_ && timing_model_)
+			return timing_model_->getConfig().vlen * timing_model_->getConfig().nr_clusters;
+		return VLEN;
 	}
 
 	~VExtension() {
@@ -356,14 +366,21 @@ class VExtension {
 			}
 
 			// If issue queue is full, scalar core must stall
+			// FIX 2026-09 (ported from Ara after Ara's own Phase 11b fix):
+			// this used to be the ONLY place a computed hazard stall became a
+			// real injected cycle. Since it only fires once the 4-deep queue
+			// is already full, the first ~4 instructions of any dependent
+			// chain never triggered it -- a fixed "free" discount on every
+			// chain. Confirmed on AraXL's own RTL via ubench_mem_hazards
+			// (dependent-chain load): ~14% underestimate across vl, and much
+			// more severely via ubench_mem_throughput (independent-register
+			// load): 31% at vl=16 growing to 77% at vl>=256 -- the model
+			// never charges any real per-instruction cost for genuinely
+			// independent instructions until 4 of them queue up. finishInstr()
+			// now injects each instruction's own computed hazard stall
+			// directly, so this path's injection is removed; only the queue
+			// bookkeeping (retire cleanup, bounded depth) remains.
 			if (vector_issue_queue_.size() >= MAX_VIQ_DEPTH) {
-				uint64_t oldest_retire_time = vector_issue_queue_.front();
-				if (now_ps < oldest_retire_time) {
-					uint64_t stall_ps = oldest_retire_time - now_ps;
-					uint64_t period_ps = iss.get_clock_cycle_period_ps();
-					uint64_t stall_cycles = (stall_ps + period_ps - 1) / period_ps;
-					iss.ara_inject_cycles(stall_cycles);
-				}
 				vector_issue_queue_.pop_front();
 			}
 		}
@@ -491,6 +508,38 @@ class VExtension {
 				if (fu >= ara_timing::AraFU::VMFPU_MUL && fu <= ara_timing::AraFU::VMFPU_FCONV) {
 					hw_lat = timing_model_->getLatFP(desc.sew);
 				}
+				// FIX (ported from Ara's v.h, 2026-09): l_fe=1 (chaining: a
+				// dependent op may start reading this result just 1 cycle
+				// after THIS op's own issue) was applied to every non-FPU
+				// category, including VLSU and VSLIDE. A load's data cannot
+				// be forwarded to a consumer 1 cycle after the load merely
+				// issues -- real memory access takes the load's full
+				// latency. Confirmed on Ara via an isolated RTL probe
+				// reproducing pathfinder's exact chain (vle32->vslide1up->
+				// vmin->vslide1down->vmin->vle32->vadd->vse32): real RTL
+				// vs VP++ matched pathfinder's real error once VLSU/VSLIDE
+				// were excluded from fast-chaining. AraXL's own pathfinder/
+				// lavamd/streamcluster all showed the same -28% to -35%
+				// under-prediction signature this fix corrects -- this
+				// exact fix was never ported to AraXL until now.
+				// SCOPED DOWN (2026-09): VLSU_GATHER/VLSU_SCATTER excluded here
+				// pending investigation -- including them caused a severe spmv
+				// regression (3.7% -> 29.9% MAPE) on AraXL, unlike Ara where
+				// this fix (ported from Ara's v.h) was validated clean. Likely
+				// an unrelated spmv error was being accidentally masked by the
+				// old fast-chaining assumption specifically for gather/scatter;
+				// narrowing to the categories pathfinder's confirmed chain
+				// actually uses (unit-stride load/store, strided, slide) keeps
+				// the validated pathfinder fix while testing whether
+				// gather/scatter specifically was the regression's cause.
+				bool is_slow_chain = (fu == ara_timing::AraFU::VLSU_UNIT_LD ||
+				                      fu == ara_timing::AraFU::VLSU_UNIT_ST ||
+				                      fu == ara_timing::AraFU::VLSU_STRIDED_LD ||
+				                      fu == ara_timing::AraFU::VLSU_STRIDED_ST ||
+				                      fu == ara_timing::AraFU::VSLIDE);
+				if (is_slow_chain) {
+					hw_lat = cycles;
+				}
 				uint64_t l_fe = hw_lat;
 
 				if (scalar_hiding_enabled_) {
@@ -521,8 +570,46 @@ class VExtension {
 					// WAW hazards
 					if (start_time_ps < reg_ready_time_ps_[rd]) start_time_ps = reg_ready_time_ps_[rd];
 
+					// FIX 2026-09 (ported from Ara): inject this instruction's
+					// real hazard-driven wait directly, into the real clock,
+					// right here -- for EVERY vector instruction, starting
+					// from the very first one. See the comment in prepInstr()
+					// for why the old queue-overflow-only injection was wrong.
+					if (start_time_ps > now_ps) {
+						uint64_t hazard_stall_ps = start_time_ps - now_ps;
+						uint64_t hazard_stall_cycles = hazard_stall_ps / period_ps;
+						if (hazard_stall_cycles > 0) {
+							iss.ara_inject_cycles(hazard_stall_cycles);
+						}
+					}
+
 					// Update scoreboard
-					fu_ready_time_ps_[fu_idx] = start_time_ps + (n_beats * period_ps);
+					// FIX 2026-09: fu_ready_time_ps_ (structural occupancy,
+					// gates back-to-back reissue of the same fu_idx) used
+					// bare n_beats for every category, including LSU loads --
+					// AraXL never got the load-occupancy split Ara's RTL
+					// forced. First fit attempt used ~0.89*n_beats + 2,
+					// derived assuming n_beats divided by nr_lanes only --
+					// wrong, since computeNBeats() here already divides by
+					// nr_lanes*nr_clusters (see its own P2-fix comment).
+					// Re-deriving with the CORRECT (per-cluster) n_beats
+					// against the same RTL data (ubench_mem_throughput,
+					// 4L/2C/1024V, e64/m8) matches Ara's own unit-stride-load
+					// formula almost exactly (9/16/30/58 predicted vs.
+					// 9.72/16.34/31.19/59.19 measured at n_beats=4/8/16/32) --
+					// which makes structural sense: NrClusters is literally
+					// "Number of Ara instances" (ara_system.sv), so each
+					// cluster's own LSU is the same physical design as
+					// single-cluster Ara's, and a per-cluster n_beats should
+					// behave identically. Scoped to VLSU_UNIT_LD specifically;
+					// stores/gather/strided/scatter are left on plain
+					// n_beats since no RTL evidence has been gathered for
+					// them yet on AraXL.
+					uint64_t occupancy_beats = n_beats;
+					if (fu == ara_timing::AraFU::VLSU_UNIT_LD) {
+						occupancy_beats = (7 * (n_beats + 1) + 2) / 4;
+					}
+					fu_ready_time_ps_[fu_idx] = start_time_ps + (occupancy_beats * period_ps);
 					reg_first_element_ready_ps_[rd] = start_time_ps + (l_fe * period_ps);
 					reg_ready_time_ps_[rd] = start_time_ps + (cycles * period_ps);
 
@@ -584,9 +671,22 @@ class VExtension {
 		// Use the timing model's configured VLEN for VLMAX computation
 		// when the timing model is active. This ensures the ISS matches
 		// the target hardware's register file capacity.
+		//
+		// FIX 2026-09: was missing the nr_clusters factor. Real AraXL RTL
+		// (ara_system.sv: "NrClusters ... Number of Ara instances") gives
+		// each cluster its own full VLEN-sized register file, so the real,
+		// ISA-visible VLMAX spans ALL clusters (VLEN * NrClusters), not one
+		// cluster's VLEN alone. Confirmed empirically: real RTL's per-
+		// instruction cost for ubench_mem_throughput (independent-register
+		// load, LMUL=8/e64, 4L/2C/1024V) keeps growing from vl=128 to
+		// vl=256 before leveling off, exactly where lmul*VLEN*NrClusters/SEW
+		// = 8*1024*2/64 = 256 predicts -- the old formula (lmul*VLEN/SEW =
+		// 128) silently clamped every vl>=128 request to half the real
+		// hardware limit, feeding a wrong (too-small) vl into every
+		// downstream cycle/occupancy formula for that instruction.
 		unsigned effective_vlen = VLEN;
 		if (timing_enabled_ && timing_model_) {
-			effective_vlen = timing_model_->getConfig().vlen;
+			effective_vlen = timing_model_->getConfig().vlen * timing_model_->getConfig().nr_clusters;
 		}
 		xlen_reg_t vlmax = lmul * effective_vlen / intVSew;
 
@@ -936,7 +1036,7 @@ class VExtension {
 		if (is_masked_instr) {
 			evl = std::ceil((float)iss.csrs.vl.reg.val / 8.0);
 		} else if (ldstType == load_store_type_t::whole) {
-			evl = VLEN / eew;
+			evl = effVlen() / eew;
 		} else {
 			evl = iss.csrs.vl.reg.val;
 		}
@@ -971,9 +1071,10 @@ class VExtension {
 		xlen_reg_t num_elem_per_reg = VLEN / switchElem;
 		xlen_reg_t vec_idx, elem_num;
 		if (ldstType == load_store_type_t::whole) {
+			xlen_reg_t whole_elem_per_reg = effVlen() / switchElem;
 			xlen_reg_t curr_idx = i * (iss.instr.nf() + 1) + field;
-			vec_idx = iss.instr.rd() + curr_idx / num_elem_per_reg;
-			elem_num = curr_idx % num_elem_per_reg;
+			vec_idx = iss.instr.rd() + curr_idx / whole_elem_per_reg;
+			elem_num = curr_idx % whole_elem_per_reg;
 
 		} else {
 			vec_idx = iss.instr.rd() + field * effective_mul_idx + i / num_elem_per_reg;
@@ -1948,9 +2049,14 @@ class VExtension {
 
 			double lmul = getVlmul();
 
+			// FIX 2026-09: same missing nr_clusters factor as
+			// v_set_operation()'s vlmax -- see that comment for the RTL
+			// evidence (ara_system.sv, ubench_mem_throughput). Without it,
+			// vslidedown incorrectly zero-fills real, in-range elements for
+			// any AraXL instruction with vl above one cluster's own VLMAX.
 			unsigned effective_vlen_local = VLEN;
 			if (timing_enabled_ && timing_model_) {
-				effective_vlen_local = timing_model_->getConfig().vlen;
+				effective_vlen_local = timing_model_->getConfig().vlen * timing_model_->getConfig().nr_clusters;
 			}
 			xlen_reg_t vlmax = lmul * effective_vlen_local / getIntVSew();
 			bool is_zero = (index + offset) >= vlmax || offset & ((uint64_t)1 << 63);
@@ -2008,9 +2114,14 @@ class VExtension {
 
 			double lmul = getVlmul();
 
+			// FIX 2026-09: same missing nr_clusters factor as
+			// v_set_operation()'s vlmax -- see that comment for the RTL
+			// evidence (ara_system.sv, ubench_mem_throughput). Without it,
+			// vslideup incorrectly zero-fills real, in-range elements for
+			// any AraXL instruction with vl above one cluster's own VLMAX.
 			unsigned effective_vlen_local = VLEN;
 			if (timing_enabled_ && timing_model_) {
-				effective_vlen_local = timing_model_->getConfig().vlen;
+				effective_vlen_local = timing_model_->getConfig().vlen * timing_model_->getConfig().nr_clusters;
 			}
 			xlen_reg_t vlmax = lmul * effective_vlen_local / getIntVSew();
 			uint64_t rs1_value = param_sel == param_sel_t::vx ? iss_reg_read(iss.instr.rs1()) : op1;
@@ -2045,7 +2156,7 @@ class VExtension {
 		xlen_reg_t nreg = iss.instr.rs1() + 1;
 		xlen_reg_t start = iss.csrs.vstart.reg.val;
 		xlen_reg_t sew = getIntVSew();
-		xlen_reg_t evl = nreg * VLEN / sew;
+		xlen_reg_t evl = nreg * effVlen() / sew;
 
 		/* check, if registers are aligned */
 		v_assert(v_is_aligned(iss.instr.rd(), nreg), "rd is not aligned");
@@ -2053,8 +2164,8 @@ class VExtension {
 
 		if (iss.instr.rd() != iss.instr.rs2()) {
 			for (xlen_reg_t idx = start; idx < evl; idx++) {
-				xlen_reg_t reg = idx / (VLEN / sew);
-				xlen_reg_t elem = idx % (VLEN / sew);
+				xlen_reg_t reg = idx / (effVlen() / sew);
+				xlen_reg_t elem = idx % (effVlen() / sew);
 				op_reg_t res = getSewSingleOperand(sew, iss.instr.rs2() + reg, elem, false);
 
 				writeSewSingleOperand(sew, iss.instr.rd() + reg, elem, res);

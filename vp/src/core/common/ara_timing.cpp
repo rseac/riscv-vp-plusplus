@@ -191,14 +191,33 @@ AraTimingModel::AraTimingModel(const AraConfig& cfg) : cfg_(cfg) {
 	rtl_fpu_ew32_vl256_ = (nl == 2) ? 25 : 29;
 	rtl_fpu_ew32_vl1024_ = (nl == 2) ? 26 : 30;
 
-	// FPU EW64 — same recalibration, same sweep. Measured per-instruction
-	// cost flat at ~27.4-32.3 cycles (mean ~30.6), notably higher than
-	// Ara's equivalent (~9-10.5) - consistent with AraXL's real
-	// inter-cluster interconnect adding genuine extra latency, the same
-	// pattern already found for the memory path.
-	rtl_fpu_ew64_vl16_ = 31;
-	rtl_fpu_ew64_vl256_ = (nl == 2) ? 24 : 28;
-	rtl_fpu_ew64_vl1024_ = (nl == 2) ? 25 : 29;
+	// FPU EW64 -- RECALIBRATED 2026-09 (Phase 11b, chasing a somier
+	// overestimate). The old "~27.4-32.3 cycles (mean ~30.6)" claim was
+	// never actually validated against a chain matching real application
+	// usage. Root-caused via somier's real dependent chain
+	// (vfmul->vfmacc->vfmacc->vfsqrt->vfmul.vf->vfdiv->vfmacc x3):
+	// isolating just the vfmacc.vv sub-chain on real RTL (4L/2C/1024V)
+	// measured a FLAT 11.61-11.66 cycles/instr at vl=4/16/32 (1045/1055/
+	// 1048 cycles for 90 total instructions) -- ~2.65x lower than the old
+	// "31" constant, which VP++ was reproducing almost exactly (30.74
+	// measured on the model). vl=32 falls in the vl256_ bucket per
+	// lookupRTL()'s own boundary and showed the identical flat value,
+	// directly implicating that bucket too, not just vl16_. Confirmed
+	// against RTL/Chisel source, not just curve-fit: ara_pkg.sv defines
+	// LatFCompEW64 = 5 (the real FPU pipeline's fixed latency for fused
+	// ops at EW64) -- a hardware constant with NO vl dependence, which
+	// both explains why the true value is flat across vl (5-cycle pipe +
+	// front-end dispatch/VRF-access overhead) and why "31" has no
+	// structural basis (it would imply a pipeline ~5x deeper than what
+	// actually exists). All three vl buckets share the same "flat ~30.6"
+	// origin story in the removed comment above, so all three are set to
+	// the same corrected value; vl1024_ has no direct RTL measurement
+	// (only vl<=32 was tested) but is set the same way on the strength of
+	// LatFCompEW64's vl-independence, consistent with how every other
+	// flat dependent-chain latency in this project has behaved.
+	rtl_fpu_ew64_vl16_ = 12;
+	rtl_fpu_ew64_vl256_ = 12;
+	rtl_fpu_ew64_vl1024_ = 12;
 
 	// VMFPU_FADD dependent-chain constants (see AraFU::VMFPU_FADD comment
 	// in ara_timing.h). Measured via ubench_fpu_addchain_ew32/64 on real

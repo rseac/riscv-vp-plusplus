@@ -135,6 +135,28 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	__always_inline void ara_inject_cycles(uint64_t n_cycles) {
 		uint64_t ps = n_cycles * prop_clock_cycle_period.value();
 		dbbcache.add_cycle_counter_raw(ps);
+
+		// VPPP_TIMING_DEBUG_SPLIT: track how much of the total cycle count
+		// actually came through the vector-timing-model injection path
+		// (this function), vs. everything else (scalar opMap costs,
+		// vsetvli, hazard stalls counted separately below). Diagnoses
+		// whether a benchmark's error is coming from the vector FU
+		// formulas at all, or from scalar/decoupling overhead this
+		// function never touches -- see VPPP_TIMING_DEBUG's own
+		// sum_total_cycles, which reflects computeCycles()'s raw latency
+		// output, NOT what actually got injected here.
+		struct SplitDebug {
+			bool enabled;
+			uint64_t total_injected_cycles = 0;
+			SplitDebug() : enabled(std::getenv("VPPP_TIMING_DEBUG_SPLIT") != nullptr) {}
+			~SplitDebug() {
+				if (!enabled) return;
+				fprintf(stderr, "\n[VPPP_TIMING_DEBUG_SPLIT] Total cycles injected via ara_inject_cycles: %llu\n",
+				        (unsigned long long)total_injected_cycles);
+			}
+		};
+		static SplitDebug split_dbg;
+		if (split_dbg.enabled) split_dbg.total_injected_cycles += n_cycles;
 	}
 
 	__always_inline void ara_sync_vector(Operation::OpId opId) {
