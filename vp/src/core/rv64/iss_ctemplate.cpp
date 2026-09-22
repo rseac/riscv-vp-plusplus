@@ -217,6 +217,21 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 			VPPP_PROPERTY_GET("ISS." + name(), "ara_c_fe_fpu_ew64", uint64_t, tmp);
 			ara_cfg.c_fe_fpu_ew64 = (uint32_t)tmp;
 
+			// CVA6 L1 D-cache (scalar core). Disabled unless ara_dcache_enabled=1.
+			{
+				uint64_t en = 0, sz = 8192, ways = 4, line = 32, pen = 14;
+				VPPP_PROPERTY_GET("ISS." + name(), "ara_dcache_enabled", uint64_t, en);
+				VPPP_PROPERTY_GET("ISS." + name(), "ara_dcache_size", uint64_t, sz);
+				VPPP_PROPERTY_GET("ISS." + name(), "ara_dcache_ways", uint64_t, ways);
+				VPPP_PROPERTY_GET("ISS." + name(), "ara_dcache_line", uint64_t, line);
+				VPPP_PROPERTY_GET("ISS." + name(), "ara_dcache_miss_penalty", uint64_t, pen);
+				if (en) {
+					dcache.configure((uint32_t)sz, (uint32_t)ways, (uint32_t)line);
+					dcache.miss_penalty_cycles = (uint32_t)pen;
+					dcache.enabled = true;
+				}
+			}
+
 			// Initialize the timing model in VExtension
 			v_ext.initTimingModel(ara_cfg);
 
@@ -820,6 +835,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_CASE(LB) {
 					stats.inc_loadstore();
 					uxlen_t addr = regs[instr.rs1()] + instr.I_imm();
+					dcache_load(addr);
 					regs[instr.rd()] = lscache.load_byte(addr);
 					reset_reg_zero();
 				}
@@ -828,6 +844,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_CASE(LH) {
 					stats.inc_loadstore();
 					uxlen_t addr = regs[instr.rs1()] + instr.I_imm();
+					dcache_load(addr);
 					trap_check_addr_alignment<2, true>(addr);
 					regs[instr.rd()] = lscache.load_half(addr);
 					reset_reg_zero();
@@ -837,6 +854,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_CASE(LW) {
 					stats.inc_loadstore();
 					uxlen_t addr = regs[instr.rs1()] + instr.I_imm();
+					dcache_load(addr);
 					trap_check_addr_alignment<4, true>(addr);
 					regs[instr.rd()] = lscache.load_word(addr);
 					reset_reg_zero();
@@ -846,6 +864,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_CASE(LD) {
 					stats.inc_loadstore();
 					uxlen_t addr = regs[instr.rs1()] + instr.I_imm();
+					dcache_load(addr);
 					trap_check_addr_alignment<8, true>(addr);
 					regs[instr.rd()] = lscache.load_double(addr);
 					reset_reg_zero();
@@ -855,6 +874,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_CASE(LBU) {
 					stats.inc_loadstore();
 					uxlen_t addr = regs[instr.rs1()] + instr.I_imm();
+					dcache_load(addr);
 					regs[instr.rd()] = lscache.load_ubyte(addr);
 					reset_reg_zero();
 				}
@@ -863,6 +883,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_CASE(LHU) {
 					stats.inc_loadstore();
 					uxlen_t addr = regs[instr.rs1()] + instr.I_imm();
+					dcache_load(addr);
 					trap_check_addr_alignment<2, true>(addr);
 					regs[instr.rd()] = lscache.load_uhalf(addr);
 					reset_reg_zero();
@@ -872,6 +893,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 				OP_CASE(LWU) {
 					stats.inc_loadstore();
 					uxlen_t addr = regs[instr.rs1()] + instr.I_imm();
+					dcache_load(addr);
 					trap_check_addr_alignment<4, true>(addr);
 					regs[instr.rd()] = lscache.load_uword(addr);
 					reset_reg_zero();
@@ -1767,6 +1789,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					stats.inc_loadstore();
 					uxlen_t addr = regs[instr.rs1()] + instr.I_imm();
+					dcache_load(addr);
 					trap_check_addr_alignment<4, true>(addr);
 					fp_regs.write(RD, float32_t{(uint32_t)lscache.load_uword(addr)});
 					fp_set_dirty();
@@ -2052,6 +2075,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					stats.inc_loadstore();
 					uxlen_t addr = regs[instr.rs1()] + instr.I_imm();
+					dcache_load(addr);
 					trap_check_addr_alignment<8, true>(addr);
 					fp_regs.write(RD, float64_t{(uint64_t)lscache.load_double(addr)});
 					fp_set_dirty();
@@ -7857,5 +7881,10 @@ void ISS_CT::show() {
 	// Note: Like mcycles -> Does not contain any cycles that were executed while the CSR bit mcountinhibit.CY was set.
 	std::cout << "num-cycles (mcycle) = " << _compute_and_get_current_cycles() << std::endl;
 	vppp_opclass_debug_dump();
+	if (dcache.enabled)
+		fprintf(stderr, "[DCACHE] loads=%llu misses=%llu (cold=%llu inval=%llu other=%llu)\n",
+		        (unsigned long long)dcache.accesses, (unsigned long long)dcache.misses,
+		        (unsigned long long)dcache.cold_misses, (unsigned long long)dcache.inval_misses,
+		        (unsigned long long)dcache.other_misses);
 }
 }  // namespace rv64

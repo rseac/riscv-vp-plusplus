@@ -19,6 +19,7 @@
 #include "core/common/bus_lock_if.h"
 #include "core/common/clint_if.h"
 #include "core/common/dbbcache.h"
+#include "core/common/scalar_dcache.h"
 #include "core/common/debug.h"
 #include "core/common/fp.h"
 #include "core/common/instr.h"

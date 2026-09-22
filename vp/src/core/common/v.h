@@ -1251,6 +1251,7 @@ class VExtension {
 					} else {
 						value = getSewSingleOperand(switchElem, vec_idx, elem_num, false);
 						// TODO: implement stores in LSCache able to handle unaligned access and optimized for vector
+						iss.dcache_invalidate((uint64_t)addr, switchElem / 8);
 						switch (switchElem) {
 							case 8:
 								iss.mem->store_byte(addr, value);

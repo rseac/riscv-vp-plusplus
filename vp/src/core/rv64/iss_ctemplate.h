@@ -127,6 +127,24 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 		}
 	}
 
+		ScalarDCache dcache;
+
+	// Scalar load through the modeled CVA6 L1 D-cache. CVA6 dispatches vector instructions to Ara
+	// at in-order commit, so a load miss stalls every younger instruction (including the next
+	// vector dispatch); queued vector work still executes underneath the stall.
+	__always_inline void dcache_load(uxlen_t addr) {
+		if (!dcache.enabled) return;
+		dcache.accesses++;
+		if (dcache.load((uint64_t)addr)) {
+			dcache.misses++;
+			dbbcache.add_cycle_counter_raw((uint64_t)dcache.miss_penalty_cycles * prop_clock_cycle_period.value());
+		}
+	}
+
+	__always_inline void dcache_invalidate(uint64_t addr, uint32_t bytes) {
+		if (dcache.enabled) dcache.invalidate(addr, bytes);
+	}
+
 	/**
 	 * Inject N clock cycles into the dbbcache cycle counter.
 	 * Used by the AraXL vector timing model to add dynamic vector latency.
