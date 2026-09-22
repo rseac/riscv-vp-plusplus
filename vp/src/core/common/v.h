@@ -2,10 +2,54 @@
 #include <boost/format.hpp>
 #include <boost/multiprecision/cpp_int.hpp>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 // --- XSTop (unified_ooo) Timing Model, Profile B ---
 #include "xs_timing.h"
 #include "xs_timing_classify.h"
+
+// Minimal debug instrumentation, mirroring the AraXL model's
+// VPPP_TIMING_DEBUG mechanism (which this project never had). Enabled via
+// the XS_TIMING_DEBUG env var; zero overhead otherwise. Dumped at process
+// exit so it survives however the simulation is terminated.
+namespace xs_timing_debug {
+struct FuStats {
+	uint64_t count = 0;
+	uint64_t sum_total_cycles = 0;
+	uint64_t sum_hazard_stall = 0;
+};
+struct DebugState {
+	bool enabled = false;
+	FuStats by_fu[24];  // indexed by (uint8_t)XsFU
+	DebugState() { enabled = (std::getenv("XS_TIMING_DEBUG") != nullptr); }
+	~DebugState() {
+		if (!enabled) return;
+		static const char* names[24] = {
+			"VALU", "VMFPU_MUL", "VMFPU_FMA", "VMFPU_FADD", "VMFPU_FNONCOMP",
+			"VMFPU_FCONV", "VMFPU_FDIV", "VMFPU_IDIV", "VLSU_UNIT_LD", "VLSU_UNIT_ST",
+			"VLSU_STRIDED_LD", "VLSU_STRIDED_ST", "VLSU_GATHER", "VLSU_SCATTER",
+			"VREDU_INT", "VREDU_FP", "VSLIDE", "VNARROW", "VMASK", "VMV",
+			"VSETVL", "VWHOLE_REG", "UNKNOWN", "PAD"
+		};
+		fprintf(stderr, "\n[XS_TIMING_DEBUG] Per-FU breakdown:\n");
+		uint64_t grand_total = 0, grand_count = 0;
+		for (int i = 0; i < 23; i++) {
+			const auto& s = by_fu[i];
+			if (s.count == 0) continue;
+			grand_total += s.sum_total_cycles;
+			grand_count += s.count;
+			fprintf(stderr,
+			        "  %-16s count=%8llu  sum_total_cycles=%10llu  avg=%8.2f  sum_hazard_stall=%10llu\n",
+			        names[i], (unsigned long long)s.count, (unsigned long long)s.sum_total_cycles,
+			        (double)s.sum_total_cycles / (double)s.count, (unsigned long long)s.sum_hazard_stall);
+		}
+		fprintf(stderr, "  TOTAL: count=%llu sum_total_cycles=%llu\n",
+		        (unsigned long long)grand_count, (unsigned long long)grand_total);
+	}
+};
+inline DebugState g_debug;
+}  // namespace xs_timing_debug
 
 /*
  * print unmet traps (reasons) to stdout
@@ -15,7 +59,7 @@
 #undef DEBUG_PRINT_TRAPS
 
 // TODO these should be compile arguments
-constexpr unsigned VLEN = 512;
+constexpr unsigned VLEN = 128;  // XiangShan Kunminghu VLEN; was 512 (mismatched RTL: 4x fewer strip-mine iterations)
 constexpr unsigned ELEN = 64;
 constexpr unsigned SEW_MIN = 8;
 constexpr unsigned VLENB = VLEN / 8;
@@ -46,9 +90,59 @@ class VExtension {
 	// result becomes available. Used ONLY to add RAW/WAW stalls (never to credit).
 	uint64_t vreg_ready_cycle_[NUM_REGS] = {0};
 
+	// Per-FU-category structural occupancy: absolute cycle at which this FU
+	// class can accept its next op (throughput-bound), independent of any
+	// register dependency. Indexed by (uint8_t)XsFU; 24 categories today.
+	uint64_t fu_busy_until_[24] = {0};
+
+	// Backfilling per-cycle FU occupancy (replaces in-order 'busy until'): an op that
+	// is ready early may use an idle earlier slot. Ring of SLOT_N cycles per FU class;
+	// an entry is valid only if its stored cycle matches.
+	static constexpr unsigned SLOT_N = 4096;
+	struct Slot { uint64_t cyc; uint8_t cnt; };
+	Slot fu_slots_[24][SLOT_N] = {};
+	uint8_t fu_ports_[24] = {1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1};
+	bool slots_enabled_ = false;
+	bool win_arith_only_ = false;
+
+	uint64_t findSlot(uint8_t fu, uint64_t t, uint64_t n) {
+		if (n == 0) n = 1;
+		uint8_t ports = fu_ports_[fu];
+		for (uint64_t iter = 0; iter < SLOT_N; ++iter, ++t) {
+			bool ok = true;
+			for (uint64_t k = 0; k < n && ok; ++k) {
+				const Slot& sl = fu_slots_[fu][(t + k) % SLOT_N];
+				if (sl.cyc == t + k && sl.cnt >= ports) ok = false;
+			}
+			if (ok) return t;
+		}
+		return t;
+	}
+	void markSlot(uint8_t fu, uint64_t t, uint64_t n) {
+		if (n == 0) n = 1;
+		for (uint64_t k = 0; k < n; ++k) {
+			Slot& sl = fu_slots_[fu][(t + k) % SLOT_N];
+			if (sl.cyc != t + k) { sl.cyc = t + k; sl.cnt = 0; }
+			if (sl.cnt < 255) ++sl.cnt;
+		}
+	}
+
 	// Fixed synchronous issue latency injected for every dispatched vector op
 	// (models the in-order front-end accept cost W_v). Kept small & positive.
 	uint32_t issue_latency_ = 1;
+	uint32_t extract_lat_ = 2;   // vector -> scalar (vmv.x.s / vfmv.f.s) result latency
+	uint32_t f2v_xfer_ = 0;      // extra latency when a vector op consumes a just-produced scalar FP operand
+	uint32_t red_blocks_fp_ = 0;  // FP reductions also occupy the FP ALU/FMA pipes
+	uint32_t chain_issue_ = 1;  // cycles of dispatch cost included in each dependent link
+
+	// Out-of-order vector issue: hazards delay only an op's own start time, not
+	// the core clock. A bounded in-flight window (vwin_ ops) stalls dispatch when
+	// full; csrr cycle / fences wait for all outstanding vector results.
+	static constexpr unsigned XS_WIN_MAX = 256;
+	uint32_t vwin_ = 32;                  // 0 = unbounded
+	uint64_t win_done_[XS_WIN_MAX] = {0};
+	unsigned win_head_ = 0;
+	uint64_t max_done_ = 0;
 
 	// Current cycle from the dbbcache (picoseconds -> cycles).
 	uint64_t nowCycle() const {
@@ -70,15 +164,41 @@ class VExtension {
 		timing_enabled_ = true;
 	}
 	bool timingEnabled() const { return timing_enabled_; }
+	uint64_t effVlenBytesWhole() const { return VLENB; }
+	void noteDone(uint64_t d) { if (d > max_done_) max_done_ = d; }
+	void setChainIssue(uint32_t c) { chain_issue_ = c; }
+	void setSlots(bool on) { slots_enabled_ = on; }
+	void setWinArithOnly(bool on) { win_arith_only_ = on; }
+	void setPorts(uint8_t fu, uint8_t n) { if (fu < 24 && n > 0) fu_ports_[fu] = n; }
+	void setRedBlocksFp(uint32_t b) { red_blocks_fp_ = b; }
+	void setCrossDomain(uint32_t extract, uint32_t f2v) { extract_lat_ = extract; f2v_xfer_ = f2v; }
+	void setVectorWindow(uint32_t w) { vwin_ = w > XS_WIN_MAX ? XS_WIN_MAX : w; }
+	// Wait for every outstanding vector result (called on cycle-counter reads).
+	void syncAll() {
+		if (!timing_enabled_ || !timing_model_) return;
+		uint64_t now = nowCycle();
+		if (max_done_ > now) iss.xs_inject_cycles(max_done_ - now);
+	}
 	void setCurrentOpId(Operation::OpId opId) { current_opId_ = opId; }
 
 	// Extract-from-vector ops (vmv.x.s, vfmv.f.s, vcpop.m, vfirst.m) force the
 	// consumer (scalar core) to wait for the source vector result. Valid data
 	// hazard in both profiles. Called from the ISS sync hook for these OpIds.
-	void syncOnExtract(uint32_t vsrc) {
+	void syncOnExtract(uint32_t vsrc, bool fp_dest = false) {
 		if (!timing_enabled_ || !timing_model_) return;
 		if (vsrc >= NUM_REGS) return;
 		uint64_t now = nowCycle();
+		if (iss.xs_ooo_scalar_) {
+			// Scalar result becomes ready once the source vector result is; only
+			// its consumers wait (no core-clock stall).
+			iss.xs_rob_admit();
+			uint64_t ready = std::max(now, vreg_ready_cycle_[vsrc]) + extract_lat_;
+			uint32_t rd = iss.instr.rd();
+			if (fp_dest) iss.freg_ready_cycle_[rd] = ready;
+			else if (rd != 0) iss.gpr_ready_cycle_[rd] = ready;
+			iss.xs_rob_push(ready);
+			return;
+		}
 		if (now < vreg_ready_cycle_[vsrc]) {
 			uint64_t stall = vreg_ready_cycle_[vsrc] - now;  // positive only
 			iss.xs_inject_cycles(stall);
@@ -359,7 +479,13 @@ class VExtension {
 		iss.csrs.vstart.reg.val = 0;
 
 		if (is_fp) {
-			iss.fp_finish_instr();
+			// Vector FP ops: fp_finish_instr() still handles dirty/exception
+			// flags, but current_opId_ won't match any scalar FP case in
+			// classifyScalarFp() (see iss_ctemplate.cpp), so the new scalar
+			// FP scoreboard added there is correctly a no-op here -- vector
+			// FP timing remains entirely owned by this class's own
+			// vreg_ready_cycle_ scoreboard below.
+			iss.fp_finish_instr(current_opId_);
 		}
 
 		// ============ XSTop Profile B: dynamic vector cycle injection ============
@@ -430,11 +556,38 @@ class VExtension {
 
 				uint32_t span = lmulSpan(vlmul_field);
 
+				if (iss.xs_ooo_scalar_) iss.xs_rob_admit();
 				uint64_t now = nowCycle();
+				// In-flight window: the op dispatched vwin_ ops ago must have
+				// completed before this one can be dispatched.
+				const bool is_mem_op = (opc == 0x07 || opc == 0x27);
+				// window_arith_only_: memory ops do not occupy the arithmetic issue queue
+				const unsigned wn = (vwin_ > 0 && !(win_arith_only_ && (is_mem_op || fu == xs_timing::XsFU::VMV || fu == xs_timing::XsFU::VSETVL)))
+				                        ? std::min<unsigned>(span, vwin_) : 0;  // uops of this op
+				if (vwin_ > 0 && wn > 0) {
+					uint64_t oldest = 0;
+					for (unsigned k = 0; k < wn; ++k) oldest = std::max(oldest, win_done_[(win_head_ + k) % vwin_]);
+					if (oldest > now) {
+						iss.xs_inject_cycles(oldest - now);
+						now = oldest;
+					}
+				}
 				uint64_t start = now;  // earliest issue time given hazards
+				const bool is_store = (opc == 0x27);
+				// Vector->scalar extracts write a scalar register (rd is NOT a vector reg) and
+				// read only vs2.
+				const bool scalar_dest = iss.xs_ooo_scalar_ &&
+				    (current_opId_ == Operation::OpId::VMV_X_S || current_opId_ == Operation::OpId::VFMV_F_S ||
+				     current_opId_ == Operation::OpId::VCPOP_M || current_opId_ == Operation::OpId::VFIRST_M);
+				// Integer ALU results are renamed: no WAW wait (RTL: same-dest
+				// independent vadd 1.6 cyc/op vs FP/load same-dest fully serial).
+				// Unmasked vector loads are renamed as well (warmed RTL probe: same-dest
+				// vle 2.6 cyc/op, axpy block 7.1 cyc/iter with or without reg rotation).
+				const bool is_vload = (opc == 0x07) && !masked;
+				const bool waw_renamed = ((fu == xs_timing::XsFU::VALU) && !masked) || is_vload;
 
 				// RAW on vs1 / vs2 (account for LMUL register clustering).
-				if (rs1_is_vec) {
+				if (rs1_is_vec && !scalar_dest) {
 					for (uint32_t k = 0; k < span && (vs1 + k) < NUM_REGS; ++k)
 						start = std::max(start, vreg_ready_cycle_[vs1 + k]);
 				}
@@ -442,13 +595,62 @@ class VExtension {
 					for (uint32_t k = 0; k < span && (vs2 + k) < NUM_REGS; ++k)
 						start = std::max(start, vreg_ready_cycle_[vs2 + k]);
 				}
+				// Scalar sources (scalar out-of-order mode): .vf / .vx operands and
+				// memory base/stride registers must be ready.
+				if (iss.xs_ooo_scalar_) {
+					if (opc == 0x57) {
+						if (f3 == 5) start = std::max(start, iss.freg_ready_cycle_[vs1] + (iss.freg_ready_cycle_[vs1] > now ? f2v_xfer_ : 0));
+						else if (f3 == 4 || f3 == 6) start = std::max(start, iss.gpr_ready_cycle_[vs1]);
+					} else if (opc == 0x07 || opc == 0x27) {
+						start = std::max(start, iss.gpr_ready_cycle_[vs1]);
+						if (fu == xs_timing::XsFU::VLSU_STRIDED_LD || fu == xs_timing::XsFU::VLSU_STRIDED_ST)
+							start = std::max(start, iss.gpr_ready_cycle_[vs2]);
+					}
+				}
 				// Mask source v0 (RAW on the mask register).
 				if (masked) {
 					start = std::max(start, vreg_ready_cycle_[0]);
 				}
 				// WAW on the destination group (do not clobber an in-flight write).
-				for (uint32_t k = 0; k < span && (vd + k) < NUM_REGS; ++k)
-					start = std::max(start, vreg_ready_cycle_[vd + k]);
+				// For stores vd is the DATA source, so this is a RAW wait.
+				if ((!waw_renamed || is_store) && !scalar_dest) {
+					for (uint32_t k = 0; k < span && (vd + k) < NUM_REGS; ++k)
+						start = std::max(start, vreg_ready_cycle_[vd + k]);
+				}
+
+				// FIX 2026-09: structural FU-occupancy hazard, independent of
+				// any register dependency. A real pipelined FU can only accept
+				// a new op every n_beats cycles regardless of which registers
+				// are involved; the register-only scoreboard above missed this
+				// for BURSTS of independent-register ops (e.g. lavamd's 4
+				// strided loads/iteration into 4 different destination regs --
+				// confirmed via a real-RTL probe reproducing that exact burst:
+				// RTL averaged ~5.0 cyc/load with hazard_stall from the
+				// register scoreboard alone measuring only ~0.25 cyc/load,
+				// since a 4-cycle same-register reuse gap mostly hid the
+				// per-load latency. n_beats (already computed per FU category
+				// but previously dead/unused) is exactly the missing occupancy
+				// term. Tracked per XsFU category (not a single shared LSU
+				// queue) as a first-order fix.
+				//
+				// Applied unconditionally (not gated on the register hazard):
+				// with xs_timing.h's VLSU_UNIT_LD/ST split fix, total_cycles
+				// (latency, feeds vreg_ready_cycle_ / RAW consumers) and
+				// n_beats (occupancy, feeds fu_busy_until_ here) are now
+				// DIFFERENT quantities -- latency stays the true flat L1-hit
+				// cost, throughput lives only in n_beats. An earlier version
+				// of this fix conflated the two (both categories got the same
+				// inflated value), which double-counted the same structural
+				// cost for any FU whose result is immediately RAW-consumed
+				// (confirmed via pathfinder_agnostic: -49.6% -> +49.6%, same
+				// magnitude, the double-counting signature). Gating on
+				// start==now was an earlier, ineffective attempt at a fix --
+				// pathfinder's chain instructions still satisfied start==now
+				// at this point (their own RAW wait was already resolved by
+				// elapsed time from other instructions), so gating changed
+				// nothing; the real bug was upstream in xs_timing.h.
+				if (slots_enabled_) start = findSlot((uint8_t)fu, start, std::max<uint64_t>(lat.n_beats, 1));
+				else start = std::max(start, fu_busy_until_[(uint8_t)fu]);
 
 				// The hazard stall the scalar core actually observes.
 				uint64_t hazard_stall = (start > now) ? (start - now) : 0;
@@ -456,7 +658,9 @@ class VExtension {
 				// Total visible cost = hazard stall + synchronous issue latency.
 				// Independent instructions incur only issue_latency_ here and thus
 				// OVERLAP; dependent ones additionally pay hazard_stall.
-				uint64_t inject = hazard_stall + issue_latency_;
+				// Out-of-order: the core clock advances only by the dispatch cost;
+				// the hazard wait is folded into this op's start time.
+				uint64_t inject = issue_latency_;
 				if (inject > 0) {
 					iss.xs_inject_cycles(inject);   // POSITIVE injection only
 				}
@@ -464,10 +668,65 @@ class VExtension {
 
 				// After injecting issue latency the core clock has advanced; the
 				// destination becomes ready exec_cycles later (from issue point).
-				uint64_t issue_cycle = start + issue_latency_;
+				uint64_t issue_cycle = start + chain_issue_;
 				uint64_t done = issue_cycle + exec_cycles;
-				for (uint32_t k = 0; k < span && (vd + k) < NUM_REGS; ++k)
-					vreg_ready_cycle_[vd + k] = done;
+				if (iss.xs_cold_ && (opc == 0x07 || opc == 0x27) &&
+				    fu != xs_timing::XsFU::VLSU_GATHER && fu != xs_timing::XsFU::VLSU_SCATTER) {
+					bool is_ld = (opc == 0x07);
+					uint64_t base = iss.regs[vs1];
+					uint64_t bytes = 0;
+					uint64_t esz = desc.sew / 8;
+					uint64_t nseg = (uint64_t)iss.instr.nf() + 1;
+					if (fu == xs_timing::XsFU::VLSU_STRIDED_LD || fu == xs_timing::XsFU::VLSU_STRIDED_ST) {
+						int64_t stride = (int64_t)iss.regs[vs2];
+						uint64_t pen = 0;
+						for (uint64_t i = 0; i < desc.vl; ++i)
+							pen = std::max(pen, iss.xs_dmem_access(issue_cycle, base + (uint64_t)((int64_t)i * stride), esz * nseg, is_ld, true));
+						done += pen;
+					} else {
+						if (fu == xs_timing::XsFU::VWHOLE_REG) bytes = (uint64_t)(effVlenBytesWhole()) * nseg;
+						else bytes = (uint64_t)desc.vl * esz * nseg;
+						done += iss.xs_dmem_access(issue_cycle, base, bytes, is_ld, true);
+					}
+				}
+				if (scalar_dest) {
+					uint64_t sready = done + extract_lat_;
+					if (current_opId_ == Operation::OpId::VFMV_F_S) iss.freg_ready_cycle_[vd] = sready;
+					else if (vd != 0) iss.gpr_ready_cycle_[vd] = sready;
+					if (sready > max_done_) max_done_ = sready;
+				} else if (!is_store) {
+					for (uint32_t k = 0; k < span && (vd + k) < NUM_REGS; ++k)
+						vreg_ready_cycle_[vd + k] = done;
+				}
+				if (done > max_done_) max_done_ = done;
+				if (iss.xs_ooo_scalar_) iss.xs_rob_push(done);
+				if (vwin_ > 0 && wn > 0) {
+					for (unsigned k = 0; k < wn; ++k) win_done_[(win_head_ + k) % vwin_] = done;
+					win_head_ = (win_head_ + wn) % vwin_;
+				}
+
+				// FU becomes free again for its NEXT op after n_beats (occupancy,
+				// throughput-bound) -- distinct from `done` (result latency,
+				// which gates CONSUMERS of the register, not the FU itself).
+				if (slots_enabled_) markSlot((uint8_t)fu, start, std::max<uint64_t>(lat.n_beats, 1));
+				fu_busy_until_[(uint8_t)fu] = issue_cycle + std::max<uint64_t>(lat.n_beats, 1);
+				if (red_blocks_fp_ && fu == xs_timing::XsFU::VREDU_FP) {
+					uint64_t until = issue_cycle + std::max<uint64_t>(exec_cycles, 1);
+					// mode 1: FADD+NONCOMP+FMA; mode 2: VFALU pipes only (FADD+NONCOMP)
+					if (red_blocks_fp_ != 3)  // mode 3: reduction self-occupancy only
+					for (auto b : {xs_timing::XsFU::VMFPU_FADD, xs_timing::XsFU::VMFPU_FNONCOMP})
+						fu_busy_until_[(uint8_t)b] = std::max(fu_busy_until_[(uint8_t)b], until);
+					if (red_blocks_fp_ == 1)
+						fu_busy_until_[(uint8_t)xs_timing::XsFU::VMFPU_FMA] = std::max(fu_busy_until_[(uint8_t)xs_timing::XsFU::VMFPU_FMA], until);
+					fu_busy_until_[(uint8_t)fu] = std::max(fu_busy_until_[(uint8_t)fu], until);
+				}
+
+				if (xs_timing_debug::g_debug.enabled) {
+					auto& s = xs_timing_debug::g_debug.by_fu[(int)(uint8_t)fu];
+					s.count++;
+					s.sum_total_cycles += exec_cycles;
+					s.sum_hazard_stall += hazard_stall;
+				}
 			}
 		}
 

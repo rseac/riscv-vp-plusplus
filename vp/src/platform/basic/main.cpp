@@ -54,6 +54,7 @@
 #include "platform/common/options.h"
 #include "platform/common/tagged_memory.h"
 #include "platform/common/terminal.h"
+#include "platform/common/uartlite.h"
 #include "sensor.h"
 #include "sensor2.h"
 #include "util/options.h"
@@ -93,7 +94,9 @@ class BasicOptions : public Options {
 	addr_t ethernet_start_addr = 0x30000000;
 	addr_t ethernet_end_addr = ethernet_start_addr + 1500;
 	addr_t plic_start_addr = 0x40000000;
-	addr_t plic_end_addr = 0x41000000;
+	addr_t plic_end_addr = 0x405fffff;  // trimmed so the AM UART-lite at 0x40600000 is reachable
+	addr_t uartlite_start_addr = 0x40600000;
+	addr_t uartlite_end_addr = 0x4060000f;
 	addr_t sensor_start_addr = 0x50000000;
 	addr_t sensor_end_addr = 0x50001000;
 	addr_t sensor2_start_addr = 0x50002000;
@@ -189,6 +192,7 @@ int sc_main(int argc, char **argv) {
 #endif
 
 	SimpleTerminal term("SimpleTerminal");
+	UartLite uartlite("UartLite");
 	Channel_Console channel_console;
 	FU540_UART uart("Generic_UART0", &channel_console, 6);
 	ELFLoader loader(opt.input_program.c_str());
@@ -215,7 +219,7 @@ int sc_main(int argc, char **argv) {
 	if (opt.use_debug_bus) {
 		debug_bus = new NetTrace(opt.debug_bus_port);
 	}
-	SimpleBus<3, 13> bus("SimpleBus", debug_bus, opt.break_on_transaction);
+	SimpleBus<3, 14> bus("SimpleBus", debug_bus, opt.break_on_transaction);
 
 	instr_memory_if *instr_mem_if = &iss_mem_if;
 	data_memory_if *data_mem_if = &iss_mem_if;
@@ -275,6 +279,7 @@ int sc_main(int argc, char **argv) {
 		bus.ports[it++] = new PortMapping(opt.ethernet_start_addr, opt.ethernet_end_addr, ethernet);
 		bus.ports[it++] = new PortMapping(opt.display_start_addr, opt.display_end_addr, display);
 		bus.ports[it++] = new PortMapping(opt.sys_start_addr, opt.sys_end_addr, sys);
+		bus.ports[it++] = new PortMapping(opt.uartlite_start_addr, opt.uartlite_end_addr, uartlite);
 	}
 	bus.mapping_complete();
 
@@ -302,6 +307,7 @@ int sc_main(int argc, char **argv) {
 		bus.isocks[it++].bind(ethernet.tsock);
 		bus.isocks[it++].bind(display.tsock);
 		bus.isocks[it++].bind(sys.tsock);
+		bus.isocks[it++].bind(uartlite.tsock);
 	}
 
 	// connect interrupt signals/communication

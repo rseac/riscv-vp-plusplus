@@ -1,3 +1,5 @@
+#include <vector>
+#include <unordered_map>
 /*
  * NEVER INCLUDE THIS FILE DIRECTLY!!!
  *
@@ -161,6 +163,64 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	}
 
 	/**
+	 * Per-FP-register scoreboard (RAW/WAW), mirroring VExtension's
+	 * per-vector-register vreg_ready_cycle_ in v.h. Absolute cycle at which
+	 * register f[i]'s result becomes available. Used ONLY to add stalls
+	 * (never to credit) -- see fp_finish_instr().
+	 */
+	uint64_t freg_ready_cycle_[32] = {0};
+
+	// ---- Optional scalar out-of-order timing (property xs_scalar_ooo) ----
+	// Scalar ops cost a small uniform dispatch time (opMap instr_time); their
+	// latency lives in per-register ready times, so independent scalar work
+	// overlaps and only true consumers wait. A bounded ROB-style window stalls
+	// dispatch when too many results are outstanding.
+	bool xs_ooo_scalar_ = false;
+	// FENCE: wait for all outstanding vector/scalar results, then pay the fixed drain cost.
+	bool xs_fence_sync_ = false;
+	// ---- Optional branch-misprediction model (property xs_bp_penalty > 0) ----
+	// gshare 2-bit predictor; a mispredict stalls dispatch until the branch
+	// resolves (its operands' ready time) plus a redirect penalty.
+	uint32_t xs_bp_penalty_ = 0;
+	uint32_t xs_bp_mask_ = 0;
+	uint64_t xs_bp_hist_ = 0;
+	std::vector<uint8_t> xs_bp_table_;      // gshare (history ^ pc)
+	std::vector<uint8_t> xs_bp_bimodal_;    // pc-indexed base predictor
+	uint64_t xs_bp_branches_ = 0, xs_bp_miss_ = 0;
+	// ---- Optional first-touch (cold) data-line model (property xs_cold_model) ----
+	// The ELF's data starts uncached on the RTL. The first load to a 64 B line
+	// pays extra latency; misses overlap up to a burst depth, then are
+	// throughput-limited (RTL: T(N) = M + max(0, N-4)*g).
+	bool xs_cold_ = false;
+	uint32_t xs_cold_extra_s_ = 62, xs_cold_extra_v_ = 70, xs_cold_gap_s_ = 4, xs_cold_gap_v_ = 6, xs_cold_burst_ = 4;
+	uint64_t xs_cold_gate_ = 0;
+	uint64_t xs_cold_last_page_ = ~0ull, *xs_cold_last_mask_ = nullptr;
+	std::unordered_map<uint64_t, uint64_t> xs_cold_pages_;
+	uint64_t xs_dmem_access(uint64_t t, uint64_t addr, uint64_t bytes, bool is_load, bool vec);
+	uint32_t xs_fence_cost_ = 0;
+	uint64_t gpr_ready_cycle_[32] = {0};
+	uint32_t xs_op_latency_[Operation::OpId::NUMBER_OF_OPERATIONS] = {0};
+	uint8_t xs_scalar_kind_[Operation::OpId::NUMBER_OF_OPERATIONS] = {0};
+	static constexpr unsigned XS_ROB_MAX = 1024;
+	uint32_t xs_rob_size_ = 160;
+	uint64_t xs_rob_commit_[XS_ROB_MAX] = {0};
+	unsigned xs_rob_head_ = 0;
+	uint64_t xs_rob_last_ = 0;
+	uint64_t xs_fdiv_busy_[2] = {0, 0};
+	void xs_rob_admit();
+	void xs_rob_push(uint64_t done);
+	void xs_scalar_issue(Operation::OpId op);
+	__always_inline void xs_scalar_hook(Operation::OpId op) {
+		if (xs_ooo_scalar_ && xs_scalar_kind_[op]) xs_scalar_issue(op);
+	}
+
+	__always_inline uint64_t xs_now_cycle() {
+		uint64_t period = get_clock_cycle_period_ps();
+		if (period == 0) return 0;
+		return dbbcache.get_cycle_counter_raw() / period;
+	}
+
+	/**
 	 * Sync hook for coprocessor-to-scalar extract ops and serializing ops.
 	 *
 	 * Profile B (unified_ooo): there is NO ARI queue and NO scalar hiding. The only
@@ -176,7 +236,7 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 			case Operation::OpId::VFMV_F_S:
 			case Operation::OpId::VCPOP_M:
 			case Operation::OpId::VFIRST_M:
-				v_ext.syncOnExtract(instr.rs2());
+				v_ext.syncOnExtract(instr.rs2(), opId == Operation::OpId::VFMV_F_S);
 				return;
 			default:
 				break;
@@ -268,7 +328,24 @@ class ISS_CT PROP_CLASS_FINAL : public external_interrupt_target,
 	}
 
 	void fp_prepare_instr();
-	void fp_finish_instr();
+	// P1-style fix, 2026-09: XSTop is a unified OoO core where scalar
+	// instructions previously had NO overlap modeling at all -- every scalar
+	// op's full flat latency (opMap[opId].instr_time, e.g. FADD_S=3,
+	// FDIV_S=15) was charged unconditionally and additively at fetch/decode
+	// time (dbbcache.h), with no concept of whether it actually depended on
+	// the previous instruction. That's equivalent to assuming every scalar
+	// instruction sequence is a fully dependent chain, always -- confirmed
+	// to cause severe overestimates on FP-heavy scalar code (blackscholes's
+	// CNDF polynomial: +143.6%; jacobi2d's scalar reference region: +404%).
+	// Fix: property-tree scalar FP *_instr_clock_cycles values now represent
+	// the independent/pipelined ISSUE cost only (should be set small, e.g.
+	// 1); this function adds a per-FP-register (freg_ready_cycle_) RAW/WAW
+	// scoreboard, mirroring VExtension's existing per-vector-register one in
+	// v.h, and injects ADDITIONAL positive-only stall cycles up to the real
+	// structural dependent-chain latency (scalarFpLatency() below, matching
+	// math_model_approved.md Sec 6.1's HIGH-confidence static DFF values)
+	// only when a genuine RAW/WAW hazard is detected.
+	void fp_finish_instr(Operation::OpId opId);
 	void fp_set_dirty();
 	void fp_update_exception_flags();
 	void fp_setup_rm();

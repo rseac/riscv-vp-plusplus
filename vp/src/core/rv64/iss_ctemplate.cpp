@@ -30,6 +30,9 @@ typedef __uint128_t uint128_t;
 
 #define RAISE_ILLEGAL_INSTRUCTION() raise_trap(EXC_ILLEGAL_INSTR, instr.data());
 
+static uint8_t xs_int_kind(Operation::OpId opId);
+static bool xs_fp_timed(Operation::OpId opId);
+
 #define RD instr.rd()
 #define RS1 instr.rs1()
 #define RS2 instr.rs2()
@@ -161,6 +164,13 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 
 		/* set instruction time */
 		opMap[opId].instr_time = instr_clock_cycles * prop_clock_cycle_period.value(); /* ps */
+		xs_op_latency_[opId] = (uint32_t)instr_clock_cycles;
+
+		/* optional fractional override, in 1/100 cycle (0 = unset) */
+		uint64_t instr_centicycles = 0;
+		VPPP_PROPERTY_GET("ISS." + name(), desc + "_instr_centicycles", uint64_t, instr_centicycles);
+		if (instr_centicycles != 0)
+			opMap[opId].instr_time = instr_centicycles * prop_clock_cycle_period.value() / 100;
 	}
 
 	/*
@@ -241,9 +251,104 @@ ISS_CT::ISS_CT(RV_ISA_Config *isa_config, uxlen_t hart_id)
 			VPPP_PROPERTY_GET("ISS." + name(), "xs_c_gather_rt_x10", uint64_t, tmp);
 			xs_cfg.c_gather_rt_x10 = (uint32_t)tmp;
 
+			tmp = xs_cfg.c_red_fp_fixed;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_c_red_fp_fixed", uint64_t, tmp);
+			xs_cfg.c_red_fp_fixed = (uint32_t)tmp;
+
 			tmp = xs_cfg.c_reissue;
 			VPPP_PROPERTY_GET("ISS." + name(), "xs_c_reissue", uint64_t, tmp);
 			xs_cfg.c_reissue = (uint32_t)tmp;
+
+			tmp = 0;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_bp_penalty", uint64_t, tmp);
+			xs_bp_penalty_ = (uint32_t)tmp;
+			if (xs_bp_penalty_) {
+				uint64_t bits = 12;
+				VPPP_PROPERTY_GET("ISS." + name(), "xs_bp_bits", uint64_t, bits);
+				xs_bp_mask_ = (1u << bits) - 1;
+				xs_bp_table_.assign((size_t)xs_bp_mask_ + 1, 1);  // weakly not-taken (cold BPU, no BTB hit)
+				xs_bp_bimodal_.assign((size_t)xs_bp_mask_ + 1, 1);
+			}
+
+			tmp = 0;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_cold_model", uint64_t, tmp);
+			xs_cold_ = (tmp != 0);
+			{
+				uint64_t v;
+				v = xs_cold_extra_s_; VPPP_PROPERTY_GET("ISS." + name(), "xs_cold_extra_s", uint64_t, v); xs_cold_extra_s_ = (uint32_t)v;
+				v = xs_cold_extra_v_; VPPP_PROPERTY_GET("ISS." + name(), "xs_cold_extra_v", uint64_t, v); xs_cold_extra_v_ = (uint32_t)v;
+				v = xs_cold_gap_s_;   VPPP_PROPERTY_GET("ISS." + name(), "xs_cold_gap_s", uint64_t, v);   xs_cold_gap_s_ = (uint32_t)v;
+				v = xs_cold_gap_v_;   VPPP_PROPERTY_GET("ISS." + name(), "xs_cold_gap_v", uint64_t, v);   xs_cold_gap_v_ = (uint32_t)v;
+				v = xs_cold_burst_;   VPPP_PROPERTY_GET("ISS." + name(), "xs_cold_burst", uint64_t, v);   xs_cold_burst_ = (uint32_t)v;
+			}
+
+			tmp = 1;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_fence_sync", uint64_t, tmp);
+			if (tmp) {
+				xs_fence_sync_ = true;
+				xs_fence_cost_ = xs_op_latency_[Operation::OpId::FENCE];
+				opMap[Operation::OpId::FENCE].instr_time = 0;
+			}
+
+			{
+				uint64_t ex = 2, f2v = 0, red = xs_cfg.c_red_fp_fixed;
+				VPPP_PROPERTY_GET("ISS." + name(), "xs_extract_lat", uint64_t, ex);
+				VPPP_PROPERTY_GET("ISS." + name(), "xs_f2v_xfer", uint64_t, f2v);
+				v_ext.setCrossDomain((uint32_t)ex, (uint32_t)f2v);
+			}
+
+			tmp = 0;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_win_arith_only", uint64_t, tmp);
+			v_ext.setWinArithOnly(tmp != 0);
+
+			tmp = 0;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_fu_slots", uint64_t, tmp);
+			v_ext.setSlots(tmp != 0);
+			{
+				struct { const char *key; xs_timing::XsFU fu; } pk[] = {
+				    {"xs_ports_valu", xs_timing::XsFU::VALU},         {"xs_ports_mul", xs_timing::XsFU::VMFPU_MUL},
+				    {"xs_ports_fma", xs_timing::XsFU::VMFPU_FMA},     {"xs_ports_fadd", xs_timing::XsFU::VMFPU_FADD},
+				    {"xs_ports_fnoncomp", xs_timing::XsFU::VMFPU_FNONCOMP}, {"xs_ports_fconv", xs_timing::XsFU::VMFPU_FCONV},
+				    {"xs_ports_ld", xs_timing::XsFU::VLSU_UNIT_LD},   {"xs_ports_st", xs_timing::XsFU::VLSU_UNIT_ST},
+				    {"xs_ports_sld", xs_timing::XsFU::VLSU_STRIDED_LD}, {"xs_ports_gather", xs_timing::XsFU::VLSU_GATHER}};
+				for (auto &e : pk) {
+					uint64_t np = 1;
+					VPPP_PROPERTY_GET("ISS." + name(), e.key, uint64_t, np);
+					v_ext.setPorts((uint8_t)e.fu, (uint8_t)np);
+				}
+			}
+
+			tmp = 0;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_red_blocks_fp", uint64_t, tmp);
+			v_ext.setRedBlocksFp((uint32_t)tmp);
+
+			tmp = 1;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_chain_issue", uint64_t, tmp);
+			v_ext.setChainIssue((uint32_t)tmp);
+
+			tmp = 32;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_vec_window", uint64_t, tmp);
+			v_ext.setVectorWindow((uint32_t)tmp);
+
+			tmp = 0;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_scalar_ooo", uint64_t, tmp);
+			if (tmp) {
+				uint64_t disp_centi = 25, rob = 160;
+				VPPP_PROPERTY_GET("ISS." + name(), "xs_dispatch_centicycles", uint64_t, disp_centi);
+				VPPP_PROPERTY_GET("ISS." + name(), "xs_rob_size", uint64_t, rob);
+				xs_rob_size_ = (uint32_t)std::max<uint64_t>(1, std::min<uint64_t>(rob, XS_ROB_MAX));
+				xs_ooo_scalar_ = true;
+				for (unsigned int opId = 0; opId < Operation::OpId::NUMBER_OF_OPERATIONS; ++opId) {
+					uint8_t kind = xs_int_kind((Operation::OpId)opId);
+					xs_scalar_kind_[opId] = kind;
+					if (kind || xs_fp_timed((Operation::OpId)opId))
+						opMap[opId].instr_time = disp_centi * prop_clock_cycle_period.value() / 100;
+				}
+			}
+
+			tmp = xs_cfg.fdiv_n_iter_typical;
+			VPPP_PROPERTY_GET("ISS." + name(), "xs_fdiv_n_iter_typical", uint64_t, tmp);
+			xs_cfg.fdiv_n_iter_typical = (uint32_t)tmp;
 
 			/* --- Memory (tunable / UNVALIDATED off-die) --- */
 			tmp = xs_cfg.t_l1hit;
@@ -445,6 +550,7 @@ void *ISS_CT::genOpMap() {
 	    : static struct op_label_entry OP_LABEL_ENTRY_OP(_op)                                                        \
 	          __attribute__((used, section(OP_LABLE_ENTRIES_SEC_STR))) = {Operation::OpId::_op, &&OP_LABEL_OP(_op)}; \
 	stats.inc_op(Operation::OpId::_op);                                                                              \
+	xs_scalar_hook(Operation::OpId::_op);                                                                            \
 	v_ext.setCurrentOpId(Operation::OpId::_op);
 
 #define OP_INVALID_END()                                                                                             \
@@ -599,6 +705,11 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 			/* operation implementations and implicit fast operation fetch, decode and dispatch (FFD) */
 			OP_SWITCH_BEGIN() {
 				OP_CASE(UNDEF) {
+					/* XiangShan AM (nexus-am) halt: custom 'nemu_trap' (0x0005006b), a0 = exit code */
+					if (instr.data() == 0x0005006b) {
+						sys_exit();
+						OP_END();
+					}
 					if (trace)
 						std::cout << "[ISS] WARNING: unknown instruction '" << std::to_string(instr.data())
 						          << "' at address '" << std::to_string(dbbcache.get_last_pc_before_callback()) << "'"
@@ -1040,6 +1151,10 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 
 				OP_CASE(FENCE) {
 					lscache.fence();
+					if (xs_fence_sync_) {
+						v_ext.syncAll();
+						xs_inject_cycles(xs_fence_cost_);
+					}
 				}
 				OP_END();
 
@@ -1500,7 +1615,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_add(fp_regs.f16(RS1), fp_regs.f16(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FADD_H);
 				}
 				OP_END();
 
@@ -1508,7 +1623,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_sub(fp_regs.f16(RS1), fp_regs.f16(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FSUB_H);
 				}
 				OP_END();
 
@@ -1516,7 +1631,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_mul(fp_regs.f16(RS1), fp_regs.f16(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMUL_H);
 				}
 				OP_END();
 
@@ -1524,7 +1639,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_div(fp_regs.f16(RS1), fp_regs.f16(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FDIV_H);
 				}
 				OP_END();
 
@@ -1532,7 +1647,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_sqrt(fp_regs.f16(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FSQRT_H);
 				}
 				OP_END();
 
@@ -1557,7 +1672,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 							fp_regs.write(RD, fp_regs.f16(RS2));
 					}
 
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMIN_H);
 				}
 				OP_END();
 
@@ -1582,7 +1697,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 							fp_regs.write(RD, fp_regs.f16(RS2));
 					}
 
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMAX_H);
 				}
 				OP_END();
 
@@ -1590,7 +1705,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_mulAdd(fp_regs.f16(RS1), fp_regs.f16(RS2), fp_regs.f16(RS3)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMADD_H);
 				}
 				OP_END();
 
@@ -1598,7 +1713,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_mulAdd(fp_regs.f16(RS1), fp_regs.f16(RS2), f16_neg(fp_regs.f16(RS3))));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMSUB_H);
 				}
 				OP_END();
 
@@ -1607,7 +1722,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_setup_rm();
 					fp_regs.write(RD,
 					              f16_mulAdd(f16_neg(fp_regs.f16(RS1)), fp_regs.f16(RS2), f16_neg(fp_regs.f16(RS3))));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FNMADD_H);
 				}
 				OP_END();
 
@@ -1615,7 +1730,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_mulAdd(f16_neg(fp_regs.f16(RS1)), fp_regs.f16(RS2), fp_regs.f16(RS3)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FNMSUB_H);
 				}
 				OP_END();
 
@@ -1698,7 +1813,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f16_to_i32(fp_regs.f16(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_W_H);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -1707,7 +1822,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = (int32_t)f16_to_ui32(fp_regs.f16(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_WU_H);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -1716,7 +1831,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, i32_to_f16((int32_t)regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_H_W);
 				}
 				OP_END();
 
@@ -1724,7 +1839,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, ui32_to_f16((int32_t)regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_H_WU);
 				}
 				OP_END();
 
@@ -1732,7 +1847,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_to_f32(fp_regs.f16(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_S_H);
 				}
 				OP_END();
 
@@ -1740,7 +1855,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_to_f16(fp_regs.f32(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_H_S);
 				}
 				OP_END();
 
@@ -1748,7 +1863,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_to_f16(fp_regs.f64(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_H_D);
 				}
 				OP_END();
 
@@ -1756,7 +1871,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f16_to_f64(fp_regs.f16(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_D_H);
 				}
 				OP_END();
 
@@ -1764,7 +1879,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f16_to_i64(fp_regs.f16(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_L_H);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -1773,7 +1888,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f16_to_ui64(fp_regs.f16(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_LU_H);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -1782,7 +1897,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, i64_to_f16(regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_H_L);
 				}
 				OP_END();
 
@@ -1790,7 +1905,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, ui64_to_f16(regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_H_LU);
 				}
 				OP_END();
 
@@ -1820,7 +1935,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_add(fp_regs.f32(RS1), fp_regs.f32(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FADD_S);
 				}
 				OP_END();
 
@@ -1828,7 +1943,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_sub(fp_regs.f32(RS1), fp_regs.f32(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FSUB_S);
 				}
 				OP_END();
 
@@ -1836,7 +1951,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_mul(fp_regs.f32(RS1), fp_regs.f32(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMUL_S);
 				}
 				OP_END();
 
@@ -1844,7 +1959,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_div(fp_regs.f32(RS1), fp_regs.f32(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FDIV_S);
 				}
 				OP_END();
 
@@ -1852,7 +1967,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_sqrt(fp_regs.f32(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FSQRT_S);
 				}
 				OP_END();
 
@@ -1877,7 +1992,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 							fp_regs.write(RD, fp_regs.f32(RS2));
 					}
 
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMIN_S);
 				}
 				OP_END();
 
@@ -1902,7 +2017,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 							fp_regs.write(RD, fp_regs.f32(RS2));
 					}
 
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMAX_S);
 				}
 				OP_END();
 
@@ -1910,7 +2025,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_mulAdd(fp_regs.f32(RS1), fp_regs.f32(RS2), fp_regs.f32(RS3)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMADD_S);
 				}
 				OP_END();
 
@@ -1918,7 +2033,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_mulAdd(fp_regs.f32(RS1), fp_regs.f32(RS2), f32_neg(fp_regs.f32(RS3))));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMSUB_S);
 				}
 				OP_END();
 
@@ -1927,7 +2042,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_setup_rm();
 					fp_regs.write(RD,
 					              f32_mulAdd(f32_neg(fp_regs.f32(RS1)), fp_regs.f32(RS2), f32_neg(fp_regs.f32(RS3))));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FNMADD_S);
 				}
 				OP_END();
 
@@ -1935,7 +2050,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_mulAdd(f32_neg(fp_regs.f32(RS1)), fp_regs.f32(RS2), fp_regs.f32(RS3)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FNMSUB_S);
 				}
 				OP_END();
 
@@ -1943,7 +2058,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f32_to_i32(fp_regs.f32(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_W_S);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -1952,7 +2067,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = (int32_t)f32_to_ui32(fp_regs.f32(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_WU_S);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -1961,7 +2076,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, i32_to_f32((int32_t)regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_S_W);
 				}
 				OP_END();
 
@@ -1969,7 +2084,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, ui32_to_f32((int32_t)regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_S_WU);
 				}
 				OP_END();
 
@@ -2049,7 +2164,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f32_to_i64(fp_regs.f32(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_L_S);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -2058,7 +2173,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f32_to_ui64(fp_regs.f32(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_LU_S);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -2067,7 +2182,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, i64_to_f32(regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_S_L);
 				}
 				OP_END();
 
@@ -2075,7 +2190,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, ui64_to_f32(regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_S_LU);
 				}
 				OP_END();
 
@@ -2105,7 +2220,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_add(fp_regs.f64(RS1), fp_regs.f64(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FADD_D);
 				}
 				OP_END();
 
@@ -2113,7 +2228,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_sub(fp_regs.f64(RS1), fp_regs.f64(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FSUB_D);
 				}
 				OP_END();
 
@@ -2121,7 +2236,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_mul(fp_regs.f64(RS1), fp_regs.f64(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMUL_D);
 				}
 				OP_END();
 
@@ -2129,7 +2244,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_div(fp_regs.f64(RS1), fp_regs.f64(RS2)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FDIV_D);
 				}
 				OP_END();
 
@@ -2137,7 +2252,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_sqrt(fp_regs.f64(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FSQRT_D);
 				}
 				OP_END();
 
@@ -2162,7 +2277,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 							fp_regs.write(RD, fp_regs.f64(RS2));
 					}
 
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMIN_D);
 				}
 				OP_END();
 
@@ -2187,7 +2302,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 							fp_regs.write(RD, fp_regs.f64(RS2));
 					}
 
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMAX_D);
 				}
 				OP_END();
 
@@ -2195,7 +2310,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_mulAdd(fp_regs.f64(RS1), fp_regs.f64(RS2), fp_regs.f64(RS3)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMADD_D);
 				}
 				OP_END();
 
@@ -2203,7 +2318,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_mulAdd(fp_regs.f64(RS1), fp_regs.f64(RS2), f64_neg(fp_regs.f64(RS3))));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FMSUB_D);
 				}
 				OP_END();
 
@@ -2212,7 +2327,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_setup_rm();
 					fp_regs.write(RD,
 					              f64_mulAdd(f64_neg(fp_regs.f64(RS1)), fp_regs.f64(RS2), f64_neg(fp_regs.f64(RS3))));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FNMADD_D);
 				}
 				OP_END();
 
@@ -2220,7 +2335,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_mulAdd(f64_neg(fp_regs.f64(RS1)), fp_regs.f64(RS2), fp_regs.f64(RS3)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FNMSUB_D);
 				}
 				OP_END();
 
@@ -2300,7 +2415,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f64_to_i32(fp_regs.f64(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_W_D);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -2309,7 +2424,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = (int32_t)f64_to_ui32(fp_regs.f64(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_WU_D);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -2318,7 +2433,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, i32_to_f64((int32_t)regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_D_W);
 				}
 				OP_END();
 
@@ -2326,7 +2441,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, ui32_to_f64((int32_t)regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_D_WU);
 				}
 				OP_END();
 
@@ -2334,7 +2449,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f64_to_f32(fp_regs.f64(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_S_D);
 				}
 				OP_END();
 
@@ -2342,7 +2457,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, f32_to_f64(fp_regs.f32(RS1)));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_D_S);
 				}
 				OP_END();
 
@@ -2350,7 +2465,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f64_to_i64(fp_regs.f64(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_L_D);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -2359,7 +2474,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					regs[RD] = f64_to_ui64(fp_regs.f64(RS1), softfloat_roundingMode, true);
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_LU_D);
 					reset_reg_zero();
 				}
 				OP_END();
@@ -2368,7 +2483,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, i64_to_f64(regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_D_L);
 				}
 				OP_END();
 
@@ -2376,7 +2491,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 					fp_prepare_instr();
 					fp_setup_rm();
 					fp_regs.write(RD, ui64_to_f64(regs[RS1]));
-					fp_finish_instr();
+					fp_finish_instr(Operation::OpId::FCVT_D_LU);
 				}
 				OP_END();
 
@@ -7183,9 +7298,7 @@ void ISS_CT::exec_steps(const bool debug_single_step) {
 #pragma GCC diagnostic pop
 
 uint64_t ISS_CT::_compute_and_get_current_cycles() {
-	assert(cycle_counter % prop_clock_cycle_period == sc_core::SC_ZERO_TIME);
-	assert(cycle_counter.value() % prop_clock_cycle_period.value() == 0);
-
+	/* fractional-cycle scalar costs (<OP>_instr_centicycles) leave sub-period remainders; floor to whole cycles */
 	uint64_t num_cycles = cycle_counter.value() / prop_clock_cycle_period.value();
 
 	return num_cycles;
@@ -7236,6 +7349,7 @@ uxlen_t ISS_CT::get_csr_value(uxlen_t addr) {
 
 		case CYCLE_ADDR:
 		case MCYCLE_ADDR:
+			v_ext.syncAll();
 			commit_cycles();
 			csrs.cycle.reg.val = _compute_and_get_current_cycles();
 			return csrs.cycle.reg.val;
@@ -7515,9 +7629,260 @@ std::vector<uint64_t> ISS_CT::get_registers(void) {
 	return regvals;
 }
 
-void ISS_CT::fp_finish_instr() {
+namespace {
+// Per-opcode scalar FP register-file/latency metadata for the scoreboard in
+// fp_finish_instr(). Latency values are the HIGH-confidence structural DFF
+// depths from math_model_approved.md Sec 6.1 (ALU/FAlu=3, Mul=4, FCVT=4,
+// FMA=5); FDIV/FSQRT use a flat 15 matching this project's existing
+// FDIV_S_instr_clock_cycles config default (the real per-state formula is
+// data-dependent, 9..25 -- 15 is the documented single-point anchor, not a
+// full recalibration of the iterative divider path, which is out of scope
+// here). H (half-precision) variants share their S/D siblings' latency.
+struct ScalarFpOpInfo {
+	bool valid;          // false => not a scalar FP op fp_finish_instr() scoreboards
+	bool rs1_fpr, rs2_fpr, rs3_fpr;  // which source operands are FP-register reads
+	bool rd_fpr;         // false => writes a GPR (FCVT-to-int, FMV_X_*, FEQ/FLT/FLE/FCLASS)
+	uint32_t latency;
+};
+
+ScalarFpOpInfo classifyScalarFp(Operation::OpId opId) {
+	using Op = Operation::OpId;
+	switch (opId) {
+		// ---- FAlu class (latency 3): fp-fp arithmetic/compare/sign-inject/minmax ----
+		case Op::FADD_S: case Op::FADD_D: case Op::FADD_H:
+		case Op::FSUB_S: case Op::FSUB_D: case Op::FSUB_H:
+		case Op::FSGNJ_S: case Op::FSGNJ_D: case Op::FSGNJ_H:
+		case Op::FSGNJN_S: case Op::FSGNJN_D: case Op::FSGNJN_H:
+		case Op::FSGNJX_S: case Op::FSGNJX_D: case Op::FSGNJX_H:
+		case Op::FMIN_S: case Op::FMIN_D: case Op::FMIN_H:
+		case Op::FMAX_S: case Op::FMAX_D: case Op::FMAX_H:
+			return {true, true, true, false, true, 3};
+		// Compare ops: read two FPR sources, write a GPR (comparison result).
+		case Op::FEQ_S: case Op::FEQ_D: case Op::FEQ_H:
+		case Op::FLT_S: case Op::FLT_D: case Op::FLT_H:
+		case Op::FLE_S: case Op::FLE_D: case Op::FLE_H:
+			return {true, true, true, false, false, 3};
+		// FCLASS: one FPR source, writes a GPR.
+		case Op::FCLASS_S: case Op::FCLASS_D: case Op::FCLASS_H:
+			return {true, true, false, false, false, 3};
+
+		// ---- Mul class (latency 4) ----
+		case Op::FMUL_S: case Op::FMUL_D: case Op::FMUL_H:
+			return {true, true, true, false, true, 4};
+
+		// ---- FCVT class (latency 4) ----
+		// FP -> FP precision conversion: FPR in, FPR out.
+		case Op::FCVT_S_D: case Op::FCVT_D_S:
+		case Op::FCVT_S_H: case Op::FCVT_H_S:
+		case Op::FCVT_D_H: case Op::FCVT_H_D:
+			return {true, true, false, false, true, 4};
+		// FP -> int: FPR in, GPR out.
+		case Op::FCVT_W_S: case Op::FCVT_WU_S: case Op::FCVT_L_S: case Op::FCVT_LU_S:
+		case Op::FCVT_W_D: case Op::FCVT_WU_D: case Op::FCVT_L_D: case Op::FCVT_LU_D:
+		case Op::FCVT_W_H: case Op::FCVT_WU_H: case Op::FCVT_L_H: case Op::FCVT_LU_H:
+			return {true, true, false, false, false, 4};
+		// int -> FP: GPR in, FPR out.
+		case Op::FCVT_S_W: case Op::FCVT_S_WU: case Op::FCVT_S_L: case Op::FCVT_S_LU:
+		case Op::FCVT_D_W: case Op::FCVT_D_WU: case Op::FCVT_D_L: case Op::FCVT_D_LU:
+		case Op::FCVT_H_W: case Op::FCVT_H_WU: case Op::FCVT_H_L: case Op::FCVT_H_LU:
+			return {true, false, false, false, true, 4};
+		// FMV bit-moves: same register-file pattern as FCVT-to/from-int, cheap (2).
+		case Op::FMV_X_W: case Op::FMV_X_D: case Op::FMV_X_H:
+			return {true, true, false, false, false, 2};
+		case Op::FMV_W_X: case Op::FMV_D_X: case Op::FMV_H_X:
+			return {true, false, false, false, true, 2};
+
+		// ---- FMA class (latency 5): three FPR sources (rs1,rs2,rs3), one FPR dest ----
+		case Op::FMADD_S: case Op::FMADD_D: case Op::FMADD_H:
+		case Op::FMSUB_S: case Op::FMSUB_D: case Op::FMSUB_H:
+		case Op::FNMADD_S: case Op::FNMADD_D: case Op::FNMADD_H:
+		case Op::FNMSUB_S: case Op::FNMSUB_D: case Op::FNMSUB_H:
+			return {true, true, true, true, true, 5};
+
+		// ---- Iterative divide/sqrt: flat anchor (see comment above) ----
+		case Op::FDIV_S: case Op::FDIV_D: case Op::FDIV_H:
+			return {true, true, true, false, true, 15};
+		case Op::FSQRT_S: case Op::FSQRT_D: case Op::FSQRT_H:
+			return {true, true, false, false, true, 15};
+
+		default:
+			return {false, false, false, false, false, 0};
+	}
+}
+}  // namespace
+
+void ISS_CT::fp_finish_instr(Operation::OpId opId) {
 	fp_set_dirty();
 	fp_update_exception_flags();
+
+	// ============ XSTop Profile B: scalar FP register scoreboard ============
+	// See the header comment on fp_finish_instr() for the full rationale.
+	ScalarFpOpInfo info = classifyScalarFp(opId);
+	if (info.valid && xs_ooo_scalar_) {
+		xs_rob_admit();
+		uint64_t start = xs_now_cycle();
+		if (info.rs1_fpr) start = std::max(start, freg_ready_cycle_[RS1]);
+		else start = std::max(start, gpr_ready_cycle_[RS1]);
+		if (info.rs2_fpr) start = std::max(start, freg_ready_cycle_[RS2]);
+		if (info.rs3_fpr) start = std::max(start, freg_ready_cycle_[instr.rs3()]);
+		uint32_t lat = xs_op_latency_[opId] ? xs_op_latency_[opId] : info.latency;
+		bool is_div = (opId == Operation::OpId::FDIV_S || opId == Operation::OpId::FDIV_D || opId == Operation::OpId::FDIV_H ||
+		               opId == Operation::OpId::FSQRT_S || opId == Operation::OpId::FSQRT_D || opId == Operation::OpId::FSQRT_H);
+		if (is_div) {
+			unsigned p = (xs_fdiv_busy_[0] <= xs_fdiv_busy_[1]) ? 0 : 1;
+			start = std::max(start, xs_fdiv_busy_[p]);
+			xs_fdiv_busy_[p] = start + lat;
+		}
+		uint64_t done = start + lat;
+		if (info.rd_fpr) freg_ready_cycle_[RD] = done;
+		else if (RD != 0) gpr_ready_cycle_[RD] = done;
+		xs_rob_push(done);
+		return;
+	}
+	if (info.valid) {
+		uint64_t now = xs_now_cycle();
+		uint64_t start = now;
+
+		if (info.rs1_fpr) start = std::max(start, freg_ready_cycle_[RS1]);
+		if (info.rs2_fpr) start = std::max(start, freg_ready_cycle_[RS2]);
+		if (info.rs3_fpr) start = std::max(start, freg_ready_cycle_[instr.rs3()]);
+		// WAW: don't let this write clobber an in-flight write to the same reg.
+		if (info.rd_fpr) start = std::max(start, freg_ready_cycle_[RD]);
+
+		uint64_t hazard_stall = (start > now) ? (start - now) : 0;
+		if (hazard_stall > 0) {
+			xs_inject_cycles(hazard_stall);
+		}
+
+		if (info.rd_fpr) {
+			freg_ready_cycle_[RD] = start + info.latency;
+		}
+	}
+}
+
+namespace {
+struct ScalarIntOpInfo {
+	uint8_t kind;  // 0 = not scoreboarded
+	bool rs1, rs2, rs2_fpr, rd_gpr, rd_fpr;
+};
+
+ScalarIntOpInfo classifyScalarInt(Operation::OpId opId) {
+	using Op = Operation::OpId;
+	switch (opId) {
+		case Op::ADDI: case Op::SLTI: case Op::SLTIU: case Op::XORI: case Op::ORI: case Op::ANDI:
+		case Op::SLLI: case Op::SRLI: case Op::SRAI: case Op::ADDIW: case Op::SLLIW: case Op::SRLIW: case Op::SRAIW:
+			return {1, true, false, false, true, false};
+		case Op::ADD: case Op::SUB: case Op::SLL: case Op::SLT: case Op::SLTU: case Op::XOR: case Op::SRL:
+		case Op::SRA: case Op::OR: case Op::AND: case Op::ADDW: case Op::SUBW: case Op::SLLW: case Op::SRLW:
+		case Op::SRAW: case Op::MUL: case Op::MULH: case Op::MULHSU: case Op::MULHU: case Op::DIV: case Op::DIVU:
+		case Op::REM: case Op::REMU: case Op::MULW: case Op::DIVW: case Op::DIVUW: case Op::REMW: case Op::REMUW:
+			return {1, true, true, false, true, false};
+		case Op::LUI: case Op::AUIPC:
+			return {1, false, false, false, true, false};
+		case Op::LB: case Op::LH: case Op::LW: case Op::LD: case Op::LBU: case Op::LHU: case Op::LWU:
+			return {2, true, false, false, true, false};
+		case Op::FLW: case Op::FLD: case Op::FLH:
+			return {2, true, false, false, false, true};
+		case Op::SB: case Op::SH: case Op::SW: case Op::SD:
+			return {3, true, true, false, false, false};
+		case Op::FSW: case Op::FSD: case Op::FSH:
+			return {3, true, false, true, false, false};
+		case Op::BEQ: case Op::BNE: case Op::BLT: case Op::BGE: case Op::BLTU: case Op::BGEU:
+			return {4, true, true, false, false, false};
+		case Op::JAL:
+			return {4, false, false, false, true, false};
+		case Op::JALR:
+			return {4, true, false, false, true, false};
+		default:
+			return {0, false, false, false, false, false};
+	}
+}
+}  // namespace
+
+static uint8_t xs_int_kind(Operation::OpId opId) { return classifyScalarInt(opId).kind; }
+static bool xs_fp_timed(Operation::OpId opId) { return classifyScalarFp(opId).valid; }
+
+uint64_t ISS_CT::xs_dmem_access(uint64_t t, uint64_t addr, uint64_t bytes, bool is_load, bool vec) {
+	if (bytes == 0) return 0;
+	uint64_t first = addr >> 6, last = (addr + bytes - 1) >> 6;
+	uint64_t penalty = 0;
+	uint64_t gap = vec ? xs_cold_gap_v_ : xs_cold_gap_s_;
+	uint64_t extra = vec ? xs_cold_extra_v_ : xs_cold_extra_s_;
+	for (uint64_t line = first; line <= last; ++line) {
+		uint64_t page = line >> 6, bit = 1ull << (line & 63);
+		if (page != xs_cold_last_page_) {
+			xs_cold_last_mask_ = &xs_cold_pages_[page];
+			xs_cold_last_page_ = page;
+		}
+		if (*xs_cold_last_mask_ & bit) continue;
+		*xs_cold_last_mask_ |= bit;
+		if (!is_load) continue;  // stores allocate but are not on the critical path
+		uint64_t floor_t = xs_cold_gate_ > (uint64_t)xs_cold_burst_ * gap ? xs_cold_gate_ - (uint64_t)xs_cold_burst_ * gap : 0;
+		uint64_t issue = std::max(t, floor_t);
+		xs_cold_gate_ = std::max(xs_cold_gate_, issue) + gap;
+		penalty = std::max(penalty, issue - t + extra);
+	}
+	return penalty;
+}
+
+void ISS_CT::xs_rob_admit() {
+	uint64_t oldest = xs_rob_commit_[xs_rob_head_];
+	uint64_t now = xs_now_cycle();
+	if (oldest > now) xs_inject_cycles(oldest - now);
+}
+
+void ISS_CT::xs_rob_push(uint64_t done) {
+	if (done > xs_rob_last_) xs_rob_last_ = done;
+	xs_rob_commit_[xs_rob_head_] = xs_rob_last_;
+	xs_rob_head_ = (xs_rob_head_ + 1) % xs_rob_size_;
+	v_ext.noteDone(done);
+}
+
+void ISS_CT::xs_scalar_issue(Operation::OpId op) {
+	ScalarIntOpInfo in = classifyScalarInt(op);
+	xs_rob_admit();
+	uint64_t start = xs_now_cycle();
+	if (in.rs1) start = std::max(start, gpr_ready_cycle_[RS1]);
+	if (in.rs2) start = std::max(start, gpr_ready_cycle_[RS2]);
+	if (in.rs2_fpr) start = std::max(start, freg_ready_cycle_[RS2]);
+	uint32_t lat = xs_op_latency_[op] ? xs_op_latency_[op] : 1;
+	uint64_t done = start + lat;
+	if (xs_bp_penalty_ && in.kind == 4 && in.rs2) {  // conditional branches only (JAL/JALR excluded)
+		int64_t a = (int64_t)regs[RS1], b = (int64_t)regs[RS2];
+		bool taken;
+		switch (op) {
+			case Operation::OpId::BEQ:  taken = (a == b); break;
+			case Operation::OpId::BNE:  taken = (a != b); break;
+			case Operation::OpId::BLT:  taken = (a < b); break;
+			case Operation::OpId::BGE:  taken = (a >= b); break;
+			case Operation::OpId::BLTU: taken = ((uint64_t)a < (uint64_t)b); break;
+			default:                    taken = ((uint64_t)a >= (uint64_t)b); break;
+		}
+		uint32_t pch = (uint32_t)(((uint64_t)dbbcache.get_pc_maybe_after_callback() >> 1) * 2654435761u);
+		uint8_t &ctr = xs_bp_table_[(pch ^ (uint32_t)xs_bp_hist_) & xs_bp_mask_];
+		uint8_t &bim = xs_bp_bimodal_[pch & xs_bp_mask_];
+		bool gs_strong = (ctr == 0 || ctr == 3);
+		bool pred = gs_strong ? (ctr >= 2) : (bim >= 2);
+		xs_bp_branches_++;
+		if (taken) { if (ctr < 3) ++ctr; if (bim < 3) ++bim; } else { if (ctr > 0) --ctr; if (bim > 0) --bim; }
+		xs_bp_hist_ = ((xs_bp_hist_ << 1) | (taken ? 1 : 0)) & 0xffff;
+		if (pred != taken) {
+			xs_bp_miss_++;
+			uint64_t resume = done + xs_bp_penalty_;
+			uint64_t now2 = xs_now_cycle();
+			if (resume > now2) xs_inject_cycles(resume - now2);
+		}
+	}
+	if (xs_cold_ && (in.kind == 2 || in.kind == 3)) {
+		uint64_t base = regs[RS1];
+		bool is_load = (in.kind == 2);
+		uint64_t addr = base + (is_load ? (uint64_t)instr.I_imm() : (uint64_t)instr.S_imm());
+		uint64_t bytes = 8;  // access never spans more than one line for aligned scalar accesses
+		done += xs_dmem_access(start, addr, bytes, is_load, false);
+	}
+	if (in.rd_gpr && RD != 0) gpr_ready_cycle_[RD] = done;
+	if (in.rd_fpr) freg_ready_cycle_[RD] = done;
+	xs_rob_push(done);
 }
 
 void ISS_CT::fp_prepare_instr() {
